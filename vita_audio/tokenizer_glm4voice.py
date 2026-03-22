@@ -168,7 +168,34 @@ class GLM4VoiceTokenizer:
         tts_speech = torch.cat(tts_speechs, dim=-1).cpu()
 
         return tts_speech
+    def decode_one_step(self, audio_tokens, option_steps=10, **kwargs):
+        if not hasattr(self, "whisper_model"):
+            self.load_model()
 
+        this_uuid = str(uuid.uuid4())
+        this_uuid = "abc"
+
+        tts_token = torch.tensor(audio_tokens, device=self.device).unsqueeze(0)
+
+        flow_prompt_speech_token = torch.zeros(1, 0, dtype=torch.int64).to(self.device)
+        prompt_speech_feat = torch.zeros(1, 0, 80).to(self.device)
+
+        temp = self.audio_decoder.token2wav_one_step(
+            tts_token,
+            uuid=this_uuid,
+            prompt_token=flow_prompt_speech_token.to(self.device),
+            prompt_feat=prompt_speech_feat.to(self.device),
+            finalize=True,
+            option_steps=option_steps,
+        )
+        if temp is None:
+            return None
+        tts_speech, tts_mel=temp
+        tts_speechs = []
+        tts_speechs.append(tts_speech.squeeze())
+        tts_speech = torch.cat(tts_speechs, dim=-1).cpu()
+
+        return tts_speech
     def apply_to_role(self, role, **kwargs):
         is_discrete = kwargs.get("is_discrete", False)
         if is_discrete:

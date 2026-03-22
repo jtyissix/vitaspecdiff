@@ -41,7 +41,9 @@ class AudioDecoder:
             with open(trt_path, 'rb') as f:
                 self.flow.decoder.estimator_engine = trt.Runtime(trt.Logger(trt.Logger.INFO)).deserialize_cuda_engine(f.read())
             self.flow.decoder.estimator = self.flow.decoder.estimator_engine.create_execution_context()
-            self.flow.decoder.fp16 = True
+            if 'fp16' in trt_path:
+                self.flow.decoder.fp16 = True
+                #self.flow.to(dtype=torch.float16)
         self.mel_overlap_dict = defaultdict(lambda: None)
         self.hift_cache_dict = defaultdict(lambda: None)
         self.token_min_hop_len = 2 * self.flow.input_frame_rate
@@ -101,7 +103,52 @@ class AudioDecoder:
             # if uuid in self.hift_cache_dict.keys() and self.hift_cache_dict[uuid] is not None:
             #     tts_speech = fade_in_out(tts_speech, self.hift_cache_dict[uuid]['speech'], self.speech_window)
         return tts_speech, tts_mel
+    
+    def token2wav_one_step(self, token, uuid, prompt_token=torch.zeros(1, 0, dtype=torch.int32),
+                  prompt_feat=torch.zeros(1, 0, 80), embedding=torch.zeros(1, 192), finalize=False, option_steps=10):
+        tts_mel = self.flow.inference_one_step(token=token.to(self.device),
+                                      token_len=torch.tensor([token.shape[1]], dtype=torch.int32).to(self.device),
+                                      prompt_token=prompt_token.to(self.device),
+                                      prompt_token_len=torch.tensor([prompt_token.shape[1]], dtype=torch.int32).to(
+                                          self.device),
+                                      prompt_feat=prompt_feat.to(self.device),
+                                      prompt_feat_len=torch.tensor([prompt_feat.shape[1]], dtype=torch.int32).to(
+                                          self.device),
+                                      embedding=embedding.to(self.device),
+                                      )
+        if tts_mel is None:
+            return None
+        # mel overlap fade in out
+        if self.mel_overlap_dict[uuid] is not None:
+            tts_mel = fade_in_out(tts_mel, self.mel_overlap_dict[uuid], self.mel_window)
+        # append hift cache
+        if self.hift_cache_dict[uuid] is not None:
+            hift_cache_mel, hift_cache_source = self.hift_cache_dict[uuid]['mel'], self.hift_cache_dict[uuid]['source']
+            tts_mel = torch.concat([hift_cache_mel, tts_mel], dim=2)
 
+        else:
+            hift_cache_source = torch.zeros(1, 1, 0)
+        # _tts_mel=tts_mel.contiguous()
+        # keep overlap mel and hift cache
+        if finalize is False:
+            self.mel_overlap_dict[uuid] = tts_mel[:, :, -self.mel_overlap_len:]
+            tts_mel = tts_mel[:, :, :-self.mel_overlap_len]
+            tts_speech, tts_source = self.hift.inference(mel=tts_mel, cache_source=hift_cache_source)
+
+            self.hift_cache_dict[uuid] = {'mel': tts_mel[:, :, -self.mel_cache_len:],
+                                          'source': tts_source[:, :, -self.source_cache_len:],
+                                          'speech': tts_speech[:, -self.source_cache_len:]}
+            # if self.hift_cache_dict[uuid] is not None:
+            #     tts_speech = fade_in_out(tts_speech, self.hift_cache_dict[uuid]['speech'], self.speech_window)
+            tts_speech = tts_speech[:, :-self.source_cache_len]
+
+        else:
+            tts_speech, tts_source = self.hift.inference(mel=tts_mel, cache_source=hift_cache_source)
+            del self.hift_cache_dict[uuid]
+            del self.mel_overlap_dict[uuid]
+            # if uuid in self.hift_cache_dict.keys() and self.hift_cache_dict[uuid] is not None:
+            #     tts_speech = fade_in_out(tts_speech, self.hift_cache_dict[uuid]['speech'], self.speech_window)
+        return tts_speech, tts_mel
     def offline_inference(self, token):
         this_uuid = str(uuid.uuid1())
         tts_speech, tts_mel = self.token2wav(token, uuid=this_uuid, finalize=True)

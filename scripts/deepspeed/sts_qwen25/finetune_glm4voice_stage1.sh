@@ -110,7 +110,7 @@ torchrun $DISTRIBUTED_ARGS tools/finetune_sts_v4_48_3.py \
     --report_to "tensorboard" \
     --model_max_length ${SEQ_LENGTH} \
     --gradient_checkpointing True \
-    --deepspeed ${LOCAL_CODE_PATH}/scripts/deepspeed/ds_config_zero2.json \
+    --deepspeed ${LOCAL_CODE_PATH}/scripts/deepspeed/ds_config_zero2_no_offload.json \
     --trust_remote_code False \
     --ddp_timeout 7200 \
     --ddp_backend ${DISTRIBUTED_BACKEND} \
@@ -121,8 +121,8 @@ torchrun $DISTRIBUTED_ARGS tools/finetune_sts_v4_48_3.py \
     --reset_position_ids \
     --create_attention_mask false \
     --create_attention_mask_2d false \
-    --dataloader_num_workers 1 \
-    --text-audio-interval-ratio 1 10 4 10 \
+    --dataloader_num_workers 4 \
+    --text-audio-interval-ratio 1 4 3 8 4 10 \
 
     #--language-model-freeze \
     #--dataset_joint false \

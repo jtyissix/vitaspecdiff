@@ -30,7 +30,7 @@ def get_args():
 # init parms
 args = get_args()
 
-model_name_or_path = "/home/fit/renjujty/WORK/jty/vita/models/vita_plus_normal_official/"
+model_name_or_path = "/home/fit/renjujty/jty/vita/models/vita_balance_official/"
 
 device_map = "auto"
 
@@ -42,8 +42,8 @@ audio_tokenizer_path ="/home/fit/renjujty/WORK/jty/vita/models/THUDM/"
 flow_path = "/home/fit/renjujty/WORK/jty/vita/models/Decoder/"
 
 audio_tokenizer_rank = 0
-#audio_tokenizer_type = "glm4voice"
-audio_tokenizer_type = "sensevoice_glm4voice"
+audio_tokenizer_type = "glm4voice"
+#audio_tokenizer_type = "sensevoice_glm4voice"
 
 prompt_audio_path = None
 
@@ -337,6 +337,7 @@ def run_infer_stream(audio_tensor,output_dir):
                 past_audio_token_len = 0
 
             num_audio_chunk += 1
+    #breakpoint()
     if not len(all_audio)==0:
         # logger.info(f"{output_data.shape=} {output_data[:20]=}")
         # logger.info(max(output_data))

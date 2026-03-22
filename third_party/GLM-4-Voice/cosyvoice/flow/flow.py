@@ -51,7 +51,8 @@ class MaskedDiffWithXvec(torch.nn.Module):
         self.decoder = decoder
         self.length_regulator = length_regulator
         self.only_mask_loss = only_mask_loss
-
+        self.step_cache=None
+        self.n_timesteps=10
     def forward(
             self,
             batch: dict,
@@ -143,3 +144,80 @@ class MaskedDiffWithXvec(torch.nn.Module):
         if prompt_feat.shape[1] != 0:
             feat = feat[:, :, prompt_feat.shape[1]:]
         return feat
+    def reset_step_cache(self,reset_step_cache,device):
+        if reset_step_cache:
+            #self.step_cache=None
+            self.now_step=0
+            self.t_span = torch.linspace(0, 1, self.n_timesteps + 1, device=device, dtype=torch.float32)
+            if self.decoder.t_scheduler == 'cosine':
+                self.t_span = 1 - torch.cos(self.t_span * 0.5 * torch.pi)
+            self.step_cache=[]
+            #self.step_cache.append(torch.randn([1, 80, 50 * 300], device=device))
+            #if self.decoder.fp16 is True:
+            #self.step_cache[0]=self.step_cache[0].half()
+        self.mu=None
+        self.cond=None
+        self.mask=None
+        self.spk=None
+    def set_now_steps(self,now_step):
+        self.now_step=now_step
+        self.step_cache=self.step_cache[:self.now_step+1]
+    @torch.inference_mode()
+    def inference_one_step(self,
+                  token,
+                  token_len,
+                  prompt_token,
+                  prompt_token_len,
+                  prompt_feat,
+                  prompt_feat_len,
+                  embedding):
+        assert token.shape[0] == 1
+        if self.mu is None:
+            # xvec projection
+            embedding = F.normalize(embedding, dim=1)
+            embedding = self.spk_embed_affine_layer(embedding)
+
+            # concat text and prompt_text
+            token, token_len = torch.concat([prompt_token, token], dim=1), prompt_token_len + token_len
+            mask = (~make_pad_mask(token_len)).float().unsqueeze(-1).to(embedding)
+            token = self.input_embedding(torch.clamp(token, min=0)) * mask
+
+            # text encode
+            h, h_lengths = self.encoder(token, token_len)
+            h = self.encoder_proj(h)
+            feat_len = (token_len / self.input_frame_rate * 22050 / 256).int()
+            h, h_lengths = self.length_regulator(h, feat_len)
+            self.mu=h.transpose(1, 2).contiguous()
+            # get conditions
+            conds = torch.zeros([1, feat_len.max().item(), self.output_size], device=token.device)
+            if prompt_feat.shape[1] != 0:
+                for i, j in enumerate(prompt_feat_len):
+                    conds[i, :j] = prompt_feat[i]
+            conds = conds.transpose(1, 2)
+            self.cond=conds
+            self.spk=embedding
+            self.mask = (~make_pad_mask(feat_len)).to(h)
+            self.step_cache.append(torch.randn_like(self.mu).to(self.mu.device))
+            if self.decoder.fp16 is True:
+                self.step_cache[-1]=self.step_cache[-1].half()
+
+        new_cache,_ = self.decoder.forward_one_step(
+            now_cache=self.step_cache[-1],
+            mu=self.mu,
+            mask=self.mask.unsqueeze(1),
+            spks=self.spk,
+            cond=self.cond,
+            t_span=self.t_span,
+            now_steps=self.now_step,
+        )
+        self.step_cache.append(new_cache)
+        self.now_step+=1
+        if not self.now_step==self.n_timesteps:
+            return None
+        else:
+            feat=self.step_cache[-1].float()
+            if prompt_feat.shape[1] != 0:
+                
+                feat = feat[:, :, prompt_feat.shape[1]:]
+            return feat
+    

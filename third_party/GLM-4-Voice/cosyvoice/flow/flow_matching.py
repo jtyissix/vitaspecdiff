@@ -126,6 +126,15 @@ class ConditionalCFM(BASECFM):
             return self.estimator.forward(x, mask, mu, t, spks, cond)
         
         else:
+            trt_dtype = torch.float16 if self.fp16 else torch.float32
+        
+            x    = x.to(trt_dtype).contiguous()
+            mask = mask.to(trt_dtype).contiguous()
+            mu   = mu.to(trt_dtype).contiguous()
+            t    = t.to(trt_dtype).contiguous()
+            spks = spks.to(trt_dtype).contiguous()
+            cond = cond.to(trt_dtype).contiguous()
+            
             output = torch.zeros_like(x)
             output = output.contiguous()
             self.estimator.set_input_shape('x', (2, 80, x.size(2)))
@@ -143,7 +152,7 @@ class ConditionalCFM(BASECFM):
             self.estimator.set_tensor_address('estimator_out', output.data_ptr())
             # run trt engine
             stream = torch.cuda.current_stream(x.device).cuda_stream
-            
+            '''
             self.estimator.execute_v2([x.contiguous().data_ptr(),
                                        mask.contiguous().data_ptr(),
                                        mu.contiguous().data_ptr(),
@@ -151,9 +160,9 @@ class ConditionalCFM(BASECFM):
                                        spks.contiguous().data_ptr(),
                                        cond.contiguous().data_ptr(),
                                        x.data_ptr()])
-            
+            '''
             #breakpoint()
-            #self.estimator.execute_async_v3(stream)
+            self.estimator.execute_async_v3(stream)
             #torch.cuda.current_stream(x.device).synchronize()
             return output
             #return x
@@ -198,3 +207,48 @@ class ConditionalCFM(BASECFM):
         pred = self.estimator(y, mask, mu, t.squeeze(), spks, cond)
         loss = F.mse_loss(pred * mask, u * mask, reduction="sum") / (torch.sum(mask) * u.shape[1])
         return loss, y
+    def forward_one_step(self, now_cache,mu, mask,t_span, now_steps, temperature=1.0, spks=None, cond=None):
+        #our key framework: cross-token flow cache
+        t, _, dt = t_span[now_steps], t_span[-1], t_span[now_steps+1] - t_span[now_steps]
+        #print(dt)
+        t = t.unsqueeze(dim=0)
+        x=now_cache
+        # I am storing this because I can later plot it by putting a debugger here and saving it to a file
+        # Or in future might add like a return_all_steps flag
+        
+
+        if self.inference_cfg_rate > 0:
+            # Do not use concat, it may cause memory format changed and trt infer with wrong results!
+            x_in = torch.zeros([2, 80, x.size(2)], device=x.device, dtype=x.dtype)
+            mask_in = torch.zeros([2, 1, x.size(2)], device=x.device, dtype=x.dtype)
+            mu_in = torch.zeros([2, 80, x.size(2)], device=x.device, dtype=x.dtype)
+            t_in = torch.zeros([2], device=x.device, dtype=x.dtype)
+            spks_in = torch.zeros([2, 80], device=x.device, dtype=x.dtype)
+            cond_in = torch.zeros([2, 80, x.size(2)], device=x.device, dtype=x.dtype)
+        else:
+            x_in, mask_in, mu_in, t_in, spks_in, cond_in = x, mask, mu, t, spks, cond
+        
+        # Classifier-Free Guidance inference introduced in VoiceBox
+        if self.inference_cfg_rate > 0:
+            x_in[:] = x
+            mask_in[:] = mask
+            mu_in[0] = mu
+            t_in[:] = t.unsqueeze(0)
+            spks_in[0] = spks
+            cond_in[0] = cond
+        else:
+            x_in, mask_in, mu_in, t_in, spks_in, cond_in = x, mask, mu, t, spks, cond
+        dphi_dt = self.forward_estimator(
+            x_in, mask_in,
+            mu_in, t_in,
+            spks_in,
+            cond_in
+        )
+        if self.inference_cfg_rate > 0:
+            dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [x.size(0), x.size(0)], dim=0)
+            dphi_dt = ((1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt)
+        x = x + dt * dphi_dt
+        #t = t + dt
+        
+
+        return x,None
