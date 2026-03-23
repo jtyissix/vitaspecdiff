@@ -795,6 +795,8 @@ class Qwen2MTPForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         self.mtp_embed_norms = nn.ModuleList([Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps) for _ in range(self.config.num_nextn_predict_layers)])
         self.mtp_hidden_norms = nn.ModuleList([Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps) for _ in range(self.config.num_nextn_predict_layers)])
 
+        self.stream_resume_state = None
+
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -1330,33 +1332,64 @@ class Qwen2MTPForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
  
         # ── 直接切片，不重新展开 ──────────────────────────────────────────
         effective_mode = self.mtp_inference_mode[steps_done : steps_done + max_new_tokens]
- 
-        # ── 重置 MTP 状态机内部变量，但不动 mtp_inference_mode ───────────
-        self.input_ids      = None
-        self.inputs_embeds  = None
-        self.hidden_states  = [None] * (self.config.num_nextn_predict_layers + 1)
-        self.position_ids   = None
-        self.attention_mask = None
-        self.mtp_idx        = -1
- 
-        # num_prefill_tokens 控制 forward 内部 num_decode_tokens 的起点：
-        #   num_decode_tokens = input_ids.size(1) - num_prefill_tokens
-        # 续接时 input_ids 已包含前 steps_done 个 token，所以：
-        #   num_prefill_tokens = input_ids.shape[1] - steps_done
-        # → num_decode_tokens 从 steps_done 开始，正好对齐调度表
-        # steps_done=0 时等价于原始行为
-        self.num_prefill_tokens = input_ids.shape[1] - steps_done
- 
-        # ── KV cache ─────────────────────────────────────────────────────
-        past_kv = past_key_values if past_key_values is not None else DynamicCache()
- 
-        if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids)
- 
-        cur_input = input_ids
-        cur_mask  = attention_mask
+
+        use_resume_state = (
+            past_key_values is not None
+            and self.stream_resume_state is not None
+            and self.stream_resume_state.get("steps_done") == steps_done
+        )
+
+        if use_resume_state:
+            self.input_ids = self.stream_resume_state["input_ids"]
+            self.inputs_embeds = self.stream_resume_state["inputs_embeds"]
+            self.hidden_states = self.stream_resume_state["hidden_states"]
+            self.position_ids = self.stream_resume_state["position_ids"]
+            self.attention_mask = self.stream_resume_state["attention_mask"]
+            self.mtp_idx = self.stream_resume_state["mtp_idx"]
+            self.num_prefill_tokens = self.stream_resume_state["num_prefill_tokens"]
+
+            past_kv = past_key_values
+            cur_input = self.stream_resume_state["cur_input"]
+            cur_mask = self.stream_resume_state["cur_mask"]
+        else:
+            if past_key_values is not None:
+                raise ValueError(
+                    "stream_generate resume requires matching internal stream_resume_state. "
+                    "Do not pass full-sequence input_ids together with past_key_values unless resuming "
+                    "from the same model instance and the previous stream_generate call has populated "
+                    "stream_resume_state."
+                )
+
+            self.stream_resume_state = None
+
+            # ── 重置 MTP 状态机内部变量，但不动 mtp_inference_mode ───────────
+            self.input_ids      = None
+            self.inputs_embeds  = None
+            self.hidden_states  = [None] * (self.config.num_nextn_predict_layers + 1)
+            self.position_ids   = None
+            self.attention_mask = None
+            self.mtp_idx        = -1
+
+            # num_prefill_tokens 控制 forward 内部 num_decode_tokens 的起点：
+            #   num_decode_tokens = input_ids.size(1) - num_prefill_tokens
+            # 续接时 input_ids 已包含前 steps_done 个 token，所以：
+            #   num_prefill_tokens = input_ids.shape[1] - steps_done
+            # → num_decode_tokens 从 steps_done 开始，正好对齐调度表
+            # steps_done=0 时等价于原始行为
+            self.num_prefill_tokens = input_ids.shape[1] - steps_done
+
+            # ── KV cache ─────────────────────────────────────────────────────
+            past_kv = DynamicCache()
+
+            if attention_mask is None:
+                attention_mask = torch.ones_like(input_ids)
+
+            cur_input = input_ids
+            cur_mask  = attention_mask
+
         finished  = torch.zeros(batch_size, dtype=torch.bool, device=device)
- 
+
+        produced_steps = 0
         for mode_char in effective_mode:
             with torch.no_grad():
                 out = self(
@@ -1385,12 +1418,34 @@ class Qwen2MTPForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
                 next_tok = self._sample_logits(logits, temperature, top_k, top_p)
             else:
                 next_tok = logits.argmax(dim=-1)
- 
+
+            next_input = next_tok.unsqueeze(1)
+            next_mask = torch.cat(
+                [cur_mask, torch.ones(batch_size, 1,
+                 dtype=cur_mask.dtype, device=device)],
+                dim=1,
+            )
+
+            self.stream_resume_state = {
+                "input_ids": self.input_ids,
+                "inputs_embeds": self.inputs_embeds,
+                "hidden_states": self.hidden_states,
+                "position_ids": self.position_ids,
+                "attention_mask": self.attention_mask,
+                "mtp_idx": self.mtp_idx,
+                "num_prefill_tokens": self.num_prefill_tokens,
+                "cur_input": next_input,
+                "cur_mask": next_mask,
+                "steps_done": steps_done + produced_steps + 1,
+            }
+
             # ── yield ────────────────────────────────────────────────────
             if return_past_key_values:
                 yield next_tok, past_kv
             else:
                 yield next_tok
+
+            produced_steps += 1
  
             # ── EOS 检测 ─────────────────────────────────────────────────
             if eos_ids:
@@ -1402,12 +1457,8 @@ class Qwen2MTPForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
                     break
  
             # ── 准备下一步输入 ────────────────────────────────────────────
-            cur_input = next_tok.unsqueeze(1)
-            cur_mask  = torch.cat(
-                [cur_mask, torch.ones(batch_size, 1,
-                 dtype=cur_mask.dtype, device=device)],
-                dim=1,
-            )
+            cur_input = next_input
+            cur_mask  = next_mask
     def _prepare_mtp_for_generation(
         self,
         mtp_inference_mode,
@@ -1419,6 +1470,7 @@ class Qwen2MTPForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         self.hidden_states = [None] * (self.config.num_nextn_predict_layers + 1)
         self.position_ids = None
         self.attention_mask = None
+        self.stream_resume_state = None
 
         self.mtp_idx = -1
         self.num_prefill_tokens = -1
