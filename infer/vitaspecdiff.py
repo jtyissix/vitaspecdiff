@@ -8,7 +8,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor,as_completed
 from threading import Thread
 from typing import Optional
-
+import vita_audio.models
 import numpy as np
 import torch
 import torchaudio
@@ -52,59 +52,7 @@ def extract_token_ids_as_int(text):
         pattern = re.compile(r"<\|audio_(\d+)\|>")
         token_ids = pattern.findall(text)
         return [int(id) for id in token_ids]
-class TextAudioIteratorStreamer(TextIteratorStreamer):
-    def __init__(
-        self,
-        tokenizer: "AutoTokenizer",
-        skip_prompt: bool = False,
-        timeout: Optional[float] = None,
-        **decode_kwargs,
-    ):
-        super().__init__(tokenizer, skip_prompt, timeout, **decode_kwargs)
 
-        # self.audio_offset = tokenizer.convert_tokens_to_ids("<|audio_0|>")
-        self.audio_offset = tokenizer.convert_tokens_to_ids("<|begin_of_audio|>")
-        self.num_decode_tokens = 0
-
-    def put(self, value):
-        """
-        Receives tokens, decodes them, and logger.infos them to stdout as soon as they form entire words.
-        """
-        if len(value.shape) > 1 and value.shape[0] > 1:
-            raise ValueError("TextStreamer only supports batch size 1")
-        elif len(value.shape) > 1:
-            value = value[0]
-
-        if self.skip_prompt and self.next_tokens_are_prompt:
-            self.next_tokens_are_prompt = False
-            return
-
-        self.num_decode_tokens += len(value)
-
-        # Add the new token to the cache and decodes the entire thing.
-        self.token_cache.extend(value.tolist())
-        text = self.tokenizer.decode(self.token_cache, **self.decode_kwargs)
-        # After the symbol for a new line, we flush the cache.
-        if text.endswith("\n"):
-            printable_text = text[self.print_len :]
-            self.token_cache = []
-            self.print_len = 0
-        # If the last token is a CJK character, we logger.info the characters.
-        elif len(text) > 0 and self._is_chinese_char(ord(text[-1])):
-            printable_text = text[self.print_len :]
-            self.print_len += len(printable_text)
-        elif self.token_cache[-1] >= self.audio_offset:
-            printable_text = text[self.print_len :]
-            self.print_len += len(printable_text)
-        # Otherwise, logger.infos until the last space char (simple heuristic to avoid logger.infoing incomplete words,
-        # which may change with the subsequent token -- there are probably smarter ways to do this!)
-        else:
-            printable_text = text[self.print_len : text.rfind(" ") + 1]
-            self.print_len += len(printable_text)
-
-        self.on_finalized_text(printable_text)
-        while self.text_queue.qsize() > 10:
-            time.sleep(0.01)
 
 class VitaStreaming():
     def __init__(self):
@@ -128,7 +76,7 @@ class VitaStreaming():
 
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name_or_path,
-            trust_remote_code=True,
+            trust_remote_code=False,
             device_map=device_map,
             torch_dtype=torch_dtype,
             attn_implementation="flash_attention_2",
@@ -156,8 +104,8 @@ class VitaStreaming():
         self.model.generation_config.top_k = 50
         self.model.generation_config.top_p = 1.0
         self.model.generation_config.num_beams = 1
+        self.model._prepare_mtp_for_generation(self.model.generation_config.mtp_inference_mode, max_new_tokens=self.model.generation_config.max_new_tokens)
         self.model.generation_config.pad_token_id = self.tokenizer.pad_token_id
-        self.streamer = TextAudioIteratorStreamer(self.tokenizer, skip_prompt=True)
         self.audio_offset = self.tokenizer.convert_tokens_to_ids("<|audio_0|>")
         if prompt_audio_path is not None:
             if self.audio_tokenizer.apply_to_role("system", is_discrete=True):
@@ -295,21 +243,27 @@ class VitaStreaming():
 
         self.model.generation_config.do_sample = False
 
-        generation_kwargs = dict(
-            input_ids=input_ids,
-            audios=audios,
-            audio_indices=audio_indices,
-            streamer=self.streamer,
-        )
-        thread = Thread(target=self.model.generate, kwargs=generation_kwargs)
-        thread.start()
+        
 
         generated_text = ""
         past_tts_speech_len = 0
         past_audio_token_len = 0
-
+        steps, past_kv = 0, None
         option_steps = 10
         num_audio_chunk = 0
+        toks=[]
+        for tok, kv in self.model.stream_generate(input_ids, max_new_tokens=16,
+                                      steps_done=0,
+                                      do_sample=False,
+                                      return_past_key_values=True):
+
+            toks.append(tok)
+            past_kv = kv
+            steps += 1
+        breakpoint()
+        generated_text+=self.tokenizer.decode(torch.cat(toks))
+        breakpoint()
+        '''
         for new_text in self.streamer:
             # logger.info(f"{new_text=}")
             self.audio_tokenizer.audio_decoder.flow.reset_step_cache(True,device='cuda')
@@ -338,19 +292,13 @@ class VitaStreaming():
                     else:
                         continue
                 
-                breakpoint()
+                #breakpoint()
                 # from torch.nn.attention import SDPBackend, sdpa_kernel
                 # with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
                 self._vocoder_diffusion_loop(audio_tokens,
                     source_speech_16k=prompt_audio_path,
                     num_steps=5,t0=start_time)
-                '''
-                tts_speech = self.audio_tokenizer.decode(
-                    audio_tokens,
-                    source_speech_16k=prompt_audio_path,
-                    option_steps=option_steps,
-                )
-                '''
+                
                 tts_speech=self._vocoder_diffusion_loop(audio_tokens,
                     source_speech_16k=prompt_audio_path,
                     num_steps=5,t0=start_time)
@@ -398,6 +346,7 @@ class VitaStreaming():
                 encoding="PCM_S",
                 bits_per_sample=16,
             )
+        '''
 
 
 if __name__ == "__main__":

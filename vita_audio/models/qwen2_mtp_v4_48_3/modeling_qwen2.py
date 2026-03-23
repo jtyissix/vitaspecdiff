@@ -4,8 +4,8 @@
 #             the file from the modular. If any change should be done, please apply the change to the
 #                          modular_qwen2.py file directly. One of our CI enforces this.
 #                🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
-from typing import Callable, List, Optional, Tuple, Union
-
+from typing import Callable, Dict, Iterator, List, Optional, Tuple, Union
+import torch.nn.functional as F
 import torch
 from torch import nn
 
@@ -815,7 +815,44 @@ class Qwen2MTPForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
 
     def get_decoder(self):
         return self.model
-
+    @staticmethod
+    def _sample_logits(
+        logits: "torch.Tensor",           # [batch, vocab]
+        temperature: float = 0.7,
+        top_k: int = 20,
+        top_p: float = 0.8,
+    ) -> "torch.Tensor":
+        """
+        Sample one token per batch item from raw logits.
+ 
+        Returns
+        -------
+        [batch] int64 token indices
+        """
+        import torch.nn.functional as F
+ 
+        if temperature > 0 and temperature != 1.0:
+            logits = logits / temperature
+ 
+        if top_k > 0:
+            k = min(top_k, logits.size(-1))
+            kth_vals, _ = torch.topk(logits, k, dim=-1)
+            min_kth = kth_vals[:, -1].unsqueeze(-1)
+            logits = logits.masked_fill(logits < min_kth, float("-inf"))
+ 
+        if 0.0 < top_p < 1.0:
+            sorted_logits, sorted_idx = torch.sort(logits, dim=-1, descending=True)
+            cum_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+            # shift right so we keep the first token that pushes over threshold
+            remove = cum_probs - F.softmax(sorted_logits, dim=-1) > top_p
+            remove = torch.cat(
+                [torch.zeros_like(remove[:, :1]), remove[:, :-1]], dim=-1
+            )
+            sorted_logits = sorted_logits.masked_fill(remove, float("-inf"))
+            logits = torch.zeros_like(logits).scatter(-1, sorted_idx, sorted_logits)
+ 
+        probs = F.softmax(logits, dim=-1)
+        return torch.multinomial(probs.float(), num_samples=1).squeeze(-1)
     def mtp_forward(
         self,
         mtp_idx,
@@ -1239,7 +1276,138 @@ class Qwen2MTPForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
-
+    def stream_generate(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        max_new_tokens: int = 512,
+        do_sample: bool = False,
+        temperature: float = 0.7,
+        top_k: int = 20,
+        top_p: float = 0.8,
+        repetition_penalty: float = 1.0,
+        eos_token_id: Optional[Union[int, List[int]]] = None,
+        steps_done: int = 0,
+        past_key_values: Optional[Cache] = None,
+        return_past_key_values: bool = False,
+    ):
+        """
+        Generator，每步 yield 一个 [batch] int64 token tensor。
+ 
+        使用前必须先调用一次（按最大总长度展开调度表）：
+            model._prepare_mtp_for_generation(
+                mtp_inference_mode=[1, 4, 3, 8, 4, 10],
+                max_new_tokens=8192,
+            )
+ 
+        之后所有分段调用直接按 steps_done 切片，不重新展开。
+ 
+        Parameters
+        ----------
+        steps_done=0            从头生成（默认）
+        steps_done=N            从第N步续接，MTP调度从第N位继续
+ 
+        return_past_key_values  True  → yield (token, past_kv)
+                                False → yield token
+        """
+        assert not self.training, "请先调用 model.eval()"
+        assert self.mtp_inference_mode is not None, (
+            "请先调用 model._prepare_mtp_for_generation(mtp_inference_mode, max_new_tokens=8192)"
+        )
+ 
+        import torch.nn.functional as F
+ 
+        device     = input_ids.device
+        batch_size = input_ids.shape[0]
+ 
+        # ── 归一化 eos ────────────────────────────────────────────────────
+        if eos_token_id is None:
+            eos_ids: set = set()
+        elif isinstance(eos_token_id, int):
+            eos_ids = {eos_token_id}
+        else:
+            eos_ids = set(eos_token_id)
+ 
+        # ── 直接切片，不重新展开 ──────────────────────────────────────────
+        effective_mode = self.mtp_inference_mode[steps_done : steps_done + max_new_tokens]
+ 
+        # ── 重置 MTP 状态机内部变量，但不动 mtp_inference_mode ───────────
+        self.input_ids      = None
+        self.inputs_embeds  = None
+        self.hidden_states  = [None] * (self.config.num_nextn_predict_layers + 1)
+        self.position_ids   = None
+        self.attention_mask = None
+        self.mtp_idx        = -1
+ 
+        # num_prefill_tokens 控制 forward 内部 num_decode_tokens 的起点：
+        #   num_decode_tokens = input_ids.size(1) - num_prefill_tokens
+        # 续接时 input_ids 已包含前 steps_done 个 token，所以：
+        #   num_prefill_tokens = input_ids.shape[1] - steps_done
+        # → num_decode_tokens 从 steps_done 开始，正好对齐调度表
+        # steps_done=0 时等价于原始行为
+        self.num_prefill_tokens = input_ids.shape[1] - steps_done
+ 
+        # ── KV cache ─────────────────────────────────────────────────────
+        past_kv = past_key_values if past_key_values is not None else DynamicCache()
+ 
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+ 
+        cur_input = input_ids
+        cur_mask  = attention_mask
+        finished  = torch.zeros(batch_size, dtype=torch.bool, device=device)
+ 
+        for mode_char in effective_mode:
+            with torch.no_grad():
+                out = self(
+                    input_ids=cur_input,
+                    attention_mask=cur_mask,
+                    past_key_values=past_kv,
+                    use_cache=True,
+                    num_logits_to_keep=1,
+                    return_dict=True,
+                )
+ 
+            logits  = out.logits[:, -1, :]
+            past_kv = out.past_key_values
+ 
+            # ── 重复惩罚 ─────────────────────────────────────────────────
+            if repetition_penalty != 1.0 and self.input_ids is not None:
+                for b in range(batch_size):
+                    seen = self.input_ids[b].unique()
+                    rp   = logits[b, seen]
+                    logits[b, seen] = torch.where(
+                        rp < 0, rp * repetition_penalty, rp / repetition_penalty
+                    )
+ 
+            # ── 采样 / 贪心 ──────────────────────────────────────────────
+            if do_sample:
+                next_tok = self._sample_logits(logits, temperature, top_k, top_p)
+            else:
+                next_tok = logits.argmax(dim=-1)
+ 
+            # ── yield ────────────────────────────────────────────────────
+            if return_past_key_values:
+                yield next_tok, past_kv
+            else:
+                yield next_tok
+ 
+            # ── EOS 检测 ─────────────────────────────────────────────────
+            if eos_ids:
+                finished |= torch.tensor(
+                    [t.item() in eos_ids for t in next_tok],
+                    dtype=torch.bool, device=device,
+                )
+                if finished.all():
+                    break
+ 
+            # ── 准备下一步输入 ────────────────────────────────────────────
+            cur_input = next_tok.unsqueeze(1)
+            cur_mask  = torch.cat(
+                [cur_mask, torch.ones(batch_size, 1,
+                 dtype=cur_mask.dtype, device=device)],
+                dim=1,
+            )
     def _prepare_mtp_for_generation(
         self,
         mtp_inference_mode,
