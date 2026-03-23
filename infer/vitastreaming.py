@@ -338,7 +338,7 @@ class VitaStreaming():
                     else:
                         continue
                 
-                breakpoint()
+                #breakpoint()
                 # from torch.nn.attention import SDPBackend, sdpa_kernel
                 # with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
                 self._vocoder_diffusion_loop(audio_tokens,
@@ -373,7 +373,7 @@ class VitaStreaming():
                     )  # Capture the first audio generation time
                     
                     logger.info(f"First audio generation time: {first_audio_time}")
-
+                    
                 past_tts_speech_len = len(tts_speech)
                 past_audio_token_len = len(audio_tokens)
 

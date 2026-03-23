@@ -189,6 +189,7 @@ class VitaStreaming():
         return result
     def run_infer_stream(self,audio_tensor,output_dir):
         all_audio=[]
+        self.model.stream_resume_state=None #self.draft_model
         self.audio_tokenizer.audio_decoder.reset_dict()
         self.audio_tokenizer.audio_decoder.flow.reset_step_cache(True,device='cuda')
         #logger.info("=" * 100)
@@ -255,14 +256,42 @@ class VitaStreaming():
         for tok, kv in self.model.stream_generate(input_ids, max_new_tokens=16,
                                       steps_done=0,
                                       do_sample=False,
+                                      eos_token_id=[151645, 151643],
                                       return_past_key_values=True):
 
             toks.append(tok)
             past_kv = kv
             steps += 1
+        #breakpoint()
+        generated_text=self.tokenizer.decode(torch.cat(toks))
+        audio_tokens = extract_token_ids_as_int(generated_text)
+        #print(f"{generated_text=}")
+        print(len(audio_tokens))
+        
+        self._vocoder_diffusion_loop(audio_tokens,
+            source_speech_16k=prompt_audio_path,
+            num_steps=5,t0=start_time)
+        
+        tts_speech=self._vocoder_diffusion_loop(audio_tokens,
+            source_speech_16k=prompt_audio_path,
+            num_steps=5,t0=start_time)
+        first_audio_time = (
+                        time.perf_counter() - start_time
+                    )  # Capture the first audio generation time
+                    
+        logger.info(f"First audio generation time: {first_audio_time}")
+
+        
         breakpoint()
-        generated_text+=self.tokenizer.decode(torch.cat(toks))
+        new_input = torch.cat([input_ids, torch.stack(toks, 1)], dim=1)
+        for tok in self.model.stream_generate(new_input, max_new_tokens=8192,
+                                  steps_done=steps,      # ← MTP从第5步续接
+                                  past_key_values=past_kv,
+                                eos_token_id=[151645, 151643]):
+            toks.append(tok)
+        generated_text=self.tokenizer.decode(torch.cat(toks))
         breakpoint()
+        
         '''
         for new_text in self.streamer:
             # logger.info(f"{new_text=}")
