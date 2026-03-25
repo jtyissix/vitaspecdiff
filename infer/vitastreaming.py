@@ -8,7 +8,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor,as_completed
 from threading import Thread
 from typing import Optional
-
+import vita_audio.models
 import numpy as np
 import torch
 import torchaudio
@@ -128,7 +128,7 @@ class VitaStreaming():
 
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name_or_path,
-            trust_remote_code=True,
+            trust_remote_code=False,
             device_map=device_map,
             torch_dtype=torch_dtype,
             attn_implementation="flash_attention_2",
@@ -294,7 +294,7 @@ class VitaStreaming():
         #logger.info(f"input {tokenizer.decode(input_ids[0], skip_special_tokens=False)}", flush=True)
 
         self.model.generation_config.do_sample = False
-
+        #breakpoint()
         generation_kwargs = dict(
             input_ids=input_ids,
             audios=audios,

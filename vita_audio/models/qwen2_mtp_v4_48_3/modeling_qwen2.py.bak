@@ -794,7 +794,7 @@ class Qwen2MTPForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
 
         self.mtp_embed_norms = nn.ModuleList([Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps) for _ in range(self.config.num_nextn_predict_layers)])
         self.mtp_hidden_norms = nn.ModuleList([Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps) for _ in range(self.config.num_nextn_predict_layers)])
-        self.stream_resume_state = None
+
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -979,7 +979,6 @@ class Qwen2MTPForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         >>> tokenizer.batch_decode(generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)[0]
         "Hey, are you conscious? Can you talk to me?\nI'm not conscious, but I can talk to you."
         ```"""
-        logit_test=[]
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1269,8 +1268,7 @@ class Qwen2MTPForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         if not return_dict:
             output = (logits,) + outputs[1:]
             return (loss,) + output if loss is not None else output
-        logit_test.append(logits)
-        #breakpoint()
+
         return CausalLMOutputWithPast(
             loss=loss,
             logits=logits,
@@ -1295,20 +1293,20 @@ class Qwen2MTPForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
     ):
         """
         Generator，每步 yield 一个 [batch] int64 token tensor。
-
+ 
         使用前必须先调用一次（按最大总长度展开调度表）：
             model._prepare_mtp_for_generation(
                 mtp_inference_mode=[1, 4, 3, 8, 4, 10],
                 max_new_tokens=8192,
             )
-
+ 
         之后所有分段调用直接按 steps_done 切片，不重新展开。
-
+ 
         Parameters
         ----------
         steps_done=0            从头生成（默认）
         steps_done=N            从第N步续接，MTP调度从第N位继续
-
+ 
         return_past_key_values  True  → yield (token, past_kv)
                                 False → yield token
         """
@@ -1316,12 +1314,12 @@ class Qwen2MTPForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         assert self.mtp_inference_mode is not None, (
             "请先调用 model._prepare_mtp_for_generation(mtp_inference_mode, max_new_tokens=8192)"
         )
-
+ 
         import torch.nn.functional as F
-
+ 
         device     = input_ids.device
         batch_size = input_ids.shape[0]
-
+ 
         # ── 归一化 eos ────────────────────────────────────────────────────
         if eos_token_id is None:
             eos_ids: set = set()
@@ -1329,99 +1327,59 @@ class Qwen2MTPForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             eos_ids = {eos_token_id}
         else:
             eos_ids = set(eos_token_id)
-
+ 
         # ── 直接切片，不重新展开 ──────────────────────────────────────────
         effective_mode = self.mtp_inference_mode[steps_done : steps_done + max_new_tokens]
-
-        use_resume_state = (
-            past_key_values is not None
-            and self.stream_resume_state is not None
-            and self.stream_resume_state.get("steps_done") == steps_done
-        )
-
-        if use_resume_state:
-            self.input_ids = self.stream_resume_state["input_ids"]
-            self.inputs_embeds = self.stream_resume_state["inputs_embeds"]
-            self.hidden_states = self.stream_resume_state["hidden_states"]
-            self.position_ids = self.stream_resume_state["position_ids"]
-            self.attention_mask = self.stream_resume_state["attention_mask"]
-            self.mtp_idx = self.stream_resume_state["mtp_idx"]
-            self.num_prefill_tokens = self.stream_resume_state["num_prefill_tokens"]
-
-            past_kv = past_key_values
-            cur_input = self.stream_resume_state["cur_input"]
-            cur_mask = self.stream_resume_state["cur_mask"]
-            next_pos = self.stream_resume_state["next_pos"]
-            is_prefill = False
+ 
+        # ── 重置 MTP 状态机内部变量，但不动 mtp_inference_mode ───────────
+        self.input_ids      = None
+        self.inputs_embeds  = None
+        self.hidden_states  = [None] * (self.config.num_nextn_predict_layers + 1)
+        self.position_ids   = None
+        self.attention_mask = None
+        self.mtp_idx        = -1
+ 
+        # num_prefill_tokens 控制 forward 内部 num_decode_tokens 的起点：
+        #   num_decode_tokens = input_ids.size(1) - num_prefill_tokens
+        # 续接时 input_ids 已包含前 steps_done 个 token，所以：
+        #   num_prefill_tokens = input_ids.shape[1] - steps_done
+        # → num_decode_tokens 从 steps_done 开始，正好对齐调度表
+        # steps_done=0 时等价于原始行为
+        self.num_prefill_tokens = input_ids.shape[1] - steps_done
+ 
+        # ── KV cache ─────────────────────────────────────────────────────
+        #past_kv = past_key_values if past_key_values is not None else DynamicCache()
+        if past_key_values is None or steps_done == 0:
+            past_kv = DynamicCache()          # 从头生成，全新 cache
         else:
-            if past_key_values is not None:
-                raise ValueError(
-                    "stream_generate resume requires matching internal stream_resume_state. "
-                    "Do not pass full-sequence input_ids together with past_key_values unless resuming "
-                    "from the same model instance and the previous stream_generate call has populated "
-                    "stream_resume_state."
-                )
-
-            self.stream_resume_state = None
-
-            # ── 重置 MTP 状态机内部变量，但不动 mtp_inference_mode ───────────
-            self.input_ids      = None
-            self.inputs_embeds  = None
-            self.hidden_states  = [None] * (self.config.num_nextn_predict_layers + 1)
-            self.position_ids   = None
-            self.attention_mask = None
-            self.mtp_idx        = -1
-
-            self.num_prefill_tokens = input_ids.shape[1] - steps_done
-
-            # ── KV cache ─────────────────────────────────────────────────────
-            past_kv = DynamicCache()
-
-            if attention_mask is None:
-                attention_mask = torch.ones_like(input_ids)
-
-            cur_input = input_ids
-            cur_mask  = attention_mask
-
-            # ── 模拟 HF generate 的位置计数器 ────────────────────────────────
-            # prefill 覆盖 position 0 ~ seq_len-1，之后每步 +1
-            next_pos = input_ids.shape[1]   # prefill 之后的第一个 position
-            is_prefill = True
-
+            # 续接：只保留主干层（0..27）的 KV，清掉 MTP 层（28..37）的 KV
+            num_main_layers = self.config.num_hidden_layers - self.config.num_nextn_predict_layers
+            clean_cache = DynamicCache()
+            for i in range(min(num_main_layers, len(past_key_values.key_cache))):
+                clean_cache.key_cache.append(past_key_values.key_cache[i])
+                clean_cache.value_cache.append(past_key_values.value_cache[i])
+            past_kv = clean_cache
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+ 
+        cur_input = input_ids
+        cur_mask  = attention_mask
         finished  = torch.zeros(batch_size, dtype=torch.bool, device=device)
-        produced_steps = 0
-
+ 
         for mode_char in effective_mode:
-
-            # ── 计算 cache_position / position_ids（与 HF generate 完全一致）──
-            if is_prefill:
-                # prefill：一次性处理整段输入
-                seq_len = cur_input.shape[1]
-                cache_position = torch.arange(0, seq_len, device=device)
-                position_ids   = cache_position.unsqueeze(0)          # [[0, 1, ..., seq_len-1]]
-                is_prefill = False
-                # 注意：prefill 不递增 next_pos，它已经在初始化时设为 seq_len
-            else:
-                # decode：每步一个 token，position 单调递增
-                cache_position = torch.tensor([next_pos], device=device)
-                position_ids   = cache_position.unsqueeze(0)          # [[next_pos]]
-                next_pos += 1
-
             with torch.no_grad():
                 out = self(
                     input_ids=cur_input,
                     attention_mask=cur_mask,
-                    position_ids=position_ids,
-                    cache_position=cache_position,
                     past_key_values=past_kv,
                     use_cache=True,
                     num_logits_to_keep=1,
                     return_dict=True,
                 )
-
+ 
             logits  = out.logits[:, -1, :]
             past_kv = out.past_key_values
-
+ 
             # ── 重复惩罚 ─────────────────────────────────────────────────
             if repetition_penalty != 1.0 and self.input_ids is not None:
                 for b in range(batch_size):
@@ -1430,42 +1388,19 @@ class Qwen2MTPForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
                     logits[b, seen] = torch.where(
                         rp < 0, rp * repetition_penalty, rp / repetition_penalty
                     )
-
+ 
             # ── 采样 / 贪心 ──────────────────────────────────────────────
             if do_sample:
                 next_tok = self._sample_logits(logits, temperature, top_k, top_p)
             else:
                 next_tok = logits.argmax(dim=-1)
-
-            next_input = next_tok.unsqueeze(1)
-            next_mask = torch.cat(
-                [cur_mask, torch.ones(batch_size, 1,
-                 dtype=cur_mask.dtype, device=device)],
-                dim=1,
-            )
-
-            self.stream_resume_state = {
-                "input_ids": self.input_ids,
-                "inputs_embeds": self.inputs_embeds,
-                "hidden_states": self.hidden_states,
-                "position_ids": self.position_ids,
-                "attention_mask": self.attention_mask,
-                "mtp_idx": self.mtp_idx,
-                "num_prefill_tokens": self.num_prefill_tokens,
-                "cur_input": next_input,
-                "cur_mask": next_mask,
-                "next_pos": next_pos,
-                "steps_done": steps_done + produced_steps + 1,
-            }
-
+ 
             # ── yield ────────────────────────────────────────────────────
             if return_past_key_values:
-                yield next_tok, logits,past_kv
+                yield next_tok, past_kv
             else:
-                yield next_tok,logits
-
-            produced_steps += 1
-
+                yield next_tok
+ 
             # ── EOS 检测 ─────────────────────────────────────────────────
             if eos_ids:
                 finished |= torch.tensor(
@@ -1474,113 +1409,14 @@ class Qwen2MTPForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
                 )
                 if finished.all():
                     break
-
+ 
             # ── 准备下一步输入 ────────────────────────────────────────────
-            cur_input = next_input
-            cur_mask  = next_mask
-    def speculative_verify(
-        self,
-        input_ids: torch.LongTensor,
-        draft_tokens: torch.LongTensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[Cache] = None,
-        
-    ) -> "Dict[str, torch.Tensor]":
-        """
-        Verify K draft tokens in a **single forward pass** (target model).
- 
-        Runs the backbone (main layers only, no MTP layers) on the
-        concatenated sequence [context | draft_tokens] and returns the
-        K+1 logit vectors needed for accept/reject decisions.
- 
-        Parameters
-        ----------
-        input_ids      : [batch, context_len]  already-decoded context
-        draft_tokens   : [batch, K]  tokens proposed by a draft model
-        attention_mask : [batch, context_len]  mask for context;
-                         extended automatically for draft positions
-        past_key_values: KV cache covering the context (optional).
-                         If provided the backbone processes only draft_tokens.
-        use_mtp_bonus  : If True, chain MTP heads to produce up to
-                         num_nextn_predict_layers predictions BEYOND
-                         position context_len+K (free extra speculations).
- 
-        Returns
-        -------
-        dict with keys:
- 
-        'verify_logits' : [batch, K+1, vocab]
-            verify_logits[:, k, :] is the target model's distribution for
-            the token at absolute position (context_len + k).
-            - k in [0, K-1] → verify draft_tokens[:, k]
-            - k == K         → bonus-token distribution (if all K accepted)
- 
-            Accept/reject token k:
-                p_target = softmax(verify_logits[:, k, :])[draft_tokens[:, k]]
-                p_draft  = draft_model_prob[:, k]
-                accept   = rand() < min(1.0, p_target / p_draft)
- 
-        'mtp_bonus_logits' : [batch, num_mtp_heads, vocab]   (use_mtp_bonus=True)
-            Each MTP head i predicts the token at position context_len+K+i+1,
-            chained autoregressively from the last backbone hidden state.
- 
-        Notes
-        -----
-        * This method temporarily uses the backbone in a "pass-through" way
-          (no MTP state-machine), so it is safe to call concurrently with
-          stream_generate on a separate model instance.
-        * Does NOT mutate self.input_ids or any other inference state, so it
-          can be called freely between stream_generate steps.
-        """
-        import torch.nn.functional as F
- 
-        K = draft_tokens.shape[1]
-        context_len = input_ids.shape[1]
-        batch_size = input_ids.shape[0]
-        num_main_layers = (
-            self.config.num_hidden_layers - self.config.num_nextn_predict_layers
-        )
- 
-        # ── 1. Build [context | draft] ───────────────────────────────────
-        full_ids = torch.cat([input_ids, draft_tokens], dim=1)  # [B, context_len+K]
- 
-        if attention_mask is not None:
-            full_mask = torch.cat(
-                [
-                    attention_mask,
-                    torch.ones(batch_size, K, dtype=attention_mask.dtype,
-                               device=attention_mask.device),
-                ],
+            cur_input = next_tok.unsqueeze(1)
+            cur_mask  = torch.cat(
+                [cur_mask, torch.ones(batch_size, 1,
+                 dtype=cur_mask.dtype, device=device)],
                 dim=1,
             )
-        else:
-            full_mask = None
- 
-        # ── 2. Run backbone (layers 0 .. num_main_layers-1 only) ─────────
-        # We call self.model directly to bypass the inference state machine
-        # in the outer forward().  layer_idxs restricts to main layers only.
-        with torch.no_grad():
-            backbone_out = self.model(
-                input_ids=full_ids,
-                attention_mask=full_mask,
-                past_key_values=past_key_values,
-                use_cache=(past_key_values is not None),
-                return_dict=True,
-                layer_idxs=list(range(num_main_layers)),
-            )
- 
-        # hidden : [batch, context_len+K, D]
-        hidden = backbone_out.last_hidden_state
- 
-        # ── 3. Extract K+1 verification logit vectors ────────────────────
-        # logits[i] = distribution for the token AT position i+1 (causal LM).
-        # draft_tokens[:,0] sits at position context_len  → index context_len-1
-        # bonus token       sits at position context_len+K → index context_len+K-1
-        verify_hidden = hidden[:, context_len - 1 : context_len + K, :]  # [B, K+1, D]
-        verify_logits = self.lm_head(verify_hidden)                       # [B, K+1, V]
- 
-        return verify_logits
- 
     def _prepare_mtp_for_generation(
         self,
         mtp_inference_mode,

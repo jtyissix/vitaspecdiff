@@ -16,33 +16,33 @@ then
 fi
 
 ######################################################################
-export ROOT_PATH=/data/
-export CODE_PATH=${ROOT_PATH}/VITA-Audio/
+export ROOT_PATH=/home/fit/renjujty/jty/vita/
+export CODE_PATH=${ROOT_PATH}/
 
-export LOCAL_ROOT_PATH=/data_local/
-export LOCAL_CODE_PATH=${LOCAL_ROOT_PATH}/VITA-Audio/
+export LOCAL_ROOT_PATH=/home/fit/renjujty/jty/vita
+export LOCAL_CODE_PATH=${LOCAL_ROOT_PATH}/
 mkdir -p ${LOCAL_ROOT_PATH}
 mkdir -p ${LOCAL_CODE_PATH}
 
-apt update
-apt install -y rsync
-rsync -a --exclude ".git" --exclude ".gitee" ${CODE_PATH}/ ${LOCAL_CODE_PATH}/
+#apt update
+#apt install -y rsync
+#rsync -a --exclude ".git" --exclude ".gitee" ${CODE_PATH}/ ${LOCAL_CODE_PATH}/
 
 cd ${LOCAL_CODE_PATH}
-rm -fr datasets
-ln -s ${ROOT_PATH}/data datasets
+#rm -fr datasets
+#ln -s ${ROOT_PATH}/data datasets
 
 ######################################################################
 SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
 source ${LOCAL_CODE_PATH}/scripts/set_env_ds_gpu.sh
-pip3 install transformers==4.48.3
+#pip install transformers==4.48.3
 #pip3 install --no-index --find-links=/data/software/ transformers==4.48.3
 
 ######################################################################
-OUTPUT_DIR=${ROOT_PATH}/output/LM/"$0"/${timestamp}/
+OUTPUT_DIR=${ROOT_PATH}/output/LM/${timestamp}/
 
 mkdir -p ${OUTPUT_DIR}
-rsync -avh $0 ${OUTPUT_DIR}
+#rsync -avh $0 ${OUTPUT_DIR}
 
 export HF_HOME="${ROOT_PATH}/data/HF_HOME_node${INDEX}/"
 mkdir -p ${HF_HOME}
@@ -61,11 +61,11 @@ echo ${@}
 ######################################################################
 DATA_PATH=${LOCAL_CODE_PATH}/configs/sts_finetune_stage1.yaml
 
-MODEL_NAME_OR_PATH=${ROOT_PATH}/output/LM/scripts/deepspeed/s2s_qwen25/finetune_glm4voice_stage1.sh/20250222_043913/
+MODEL_NAME_OR_PATH=${ROOT_PATH}/output/LM/20260320_140344/
 
-AUDIO_TOKENIZER_PATH=${ROOT_PATH}/models/THUDM/glm-4-voice-tokenizer
+AUDIO_TOKENIZER_PATH=${ROOT_PATH}/models/THUDM/
 
-rsync -avh ${DATA_PATH} ${OUTPUT_DIR}
+#rsync -avh ${DATA_PATH} ${OUTPUT_DIR}
 
 ######################################################################
 DISTRIBUTED_ARGS="
@@ -80,7 +80,7 @@ torchrun $DISTRIBUTED_ARGS tools/finetune_sts_v4_48_3.py \
     --log_level "info" \
     --do_train \
     --overwrite_output_dir \
-    --config_name vita_audio/models/qwen2_mtp_v4_48_3/config_7B_mtp1.json \
+    --config_name vita_audio/models/qwen2_mtp_v4_48_3/config_0.5B_mtp1.json \
     --tokenizer_name $MODEL_NAME_OR_PATH \
     --model_name_or_path $MODEL_NAME_OR_PATH \
     --audio_tokenizer_path $AUDIO_TOKENIZER_PATH \
@@ -110,7 +110,7 @@ torchrun $DISTRIBUTED_ARGS tools/finetune_sts_v4_48_3.py \
     --report_to "tensorboard" \
     --model_max_length ${SEQ_LENGTH} \
     --gradient_checkpointing True \
-    --deepspeed ${LOCAL_CODE_PATH}/scripts/deepspeed/ds_config_zero2.json \
+    --deepspeed ${LOCAL_CODE_PATH}/scripts/deepspeed/ds_config_zero2_no_offload.json \
     --trust_remote_code False \
     --ddp_timeout 7200 \
     --ddp_backend ${DISTRIBUTED_BACKEND} \
@@ -121,9 +121,9 @@ torchrun $DISTRIBUTED_ARGS tools/finetune_sts_v4_48_3.py \
     --reset_position_ids \
     --create_attention_mask false \
     --create_attention_mask_2d false \
-    --dataloader_num_workers 8 \
+    --dataloader_num_workers 4 \
     --language-model-freeze \
-    --text-audio-interval-ratio 1 10 4 10 \
+    --text-audio-interval-ratio 1 4 3 8 4 10 \
 
     #--language-model-freeze \
     #--dataset_joint false \

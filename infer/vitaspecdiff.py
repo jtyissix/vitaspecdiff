@@ -253,6 +253,8 @@ class VitaStreaming():
         option_steps = 10
         num_audio_chunk = 0
         toks=[]
+        logits=[]
+        '''
         for tok, kv in self.model.stream_generate(input_ids, max_new_tokens=16,
                                       steps_done=0,
                                       do_sample=False,
@@ -291,13 +293,20 @@ class VitaStreaming():
             toks.append(tok)
         generated_text=self.tokenizer.decode(torch.cat(toks))
         breakpoint()
-        
         '''
-        for new_text in self.streamer:
+        
+        for tok,logit in self.model.stream_generate(input_ids, max_new_tokens=8192,
+                                      steps_done=0,
+                                      do_sample=False,
+                                      eos_token_id=[151645, 151643],
+                                      return_past_key_values=False):
             # logger.info(f"{new_text=}")
             self.audio_tokenizer.audio_decoder.flow.reset_step_cache(True,device='cuda')
-        
-            generated_text += new_text
+            toks.append(tok)
+            logits.append(logit)
+            new_text=self.tokenizer.decode(toks[-1])
+            generated_text+=new_text
+            
             if num_audio_chunk==0:
                 print("before audio text time:",time.perf_counter() - start_time)
             
@@ -320,8 +329,13 @@ class VitaStreaming():
                         pass
                     else:
                         continue
-                
-                #breakpoint()
+                breakpoint()
+                verify_logit=self.model.speculative_verify(
+                    input_ids=input_ids,
+                    draft_tokens=torch.cat(toks,dim=-1).unsqueeze(0)
+                )
+                breakpoint()
+
                 # from torch.nn.attention import SDPBackend, sdpa_kernel
                 # with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
                 self._vocoder_diffusion_loop(audio_tokens,
@@ -375,7 +389,7 @@ class VitaStreaming():
                 encoding="PCM_S",
                 bits_per_sample=16,
             )
-        '''
+        
 
 
 if __name__ == "__main__":

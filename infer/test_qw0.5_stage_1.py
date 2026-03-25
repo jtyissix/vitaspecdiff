@@ -30,7 +30,7 @@ def get_args():
 # init parms
 args = get_args()
 
-model_name_or_path = "/home/fit/renjujty/WORK/jty/vita/models/vita_0.5b_boost_stage1/"
+model_name_or_path = "/home/fit/renjujty/WORK/jty/vita/models/vita_0.5b_balance_stage1/"
 
 device_map = "auto"
 
@@ -288,14 +288,14 @@ def run_infer_stream(audio_tensor,output_dir):
                 else:
                     continue
             elif 'balance' in model_name_or_path:
-                if num_audio_chunk == 0 and len(audio_tokens)==14:
+                if num_audio_chunk == 0 and len(audio_tokens)==8:
                     pass
                 elif len(audio_tokens) - past_audio_token_len > 16:
                     pass
                 else:
                     continue
              
-
+            breakpoint()
             # from torch.nn.attention import SDPBackend, sdpa_kernel
             # with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
             tts_speech = audio_tokenizer.decode(
