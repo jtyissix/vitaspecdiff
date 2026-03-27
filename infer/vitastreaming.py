@@ -403,7 +403,7 @@ class VitaStreaming():
 if __name__ == "__main__":
     
     vita=VitaStreaming()
-    audio_input = '/home/fit/renjujty/WORK/audios/0.wav'
+    audio_input = '/home/fit/renjujty/WORK/audios/1.wav'
     if audio_input is not None:
         for i in range(7):
             vita.run_infer_stream(audio_input,'/home/fit/renjujty/WORK/vita_temp/')

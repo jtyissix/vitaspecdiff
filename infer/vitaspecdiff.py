@@ -330,12 +330,14 @@ class VitaStreaming():
                     else:
                         continue
                 breakpoint()
+                '''
+                breakpoint()
                 verify_logit=self.model.speculative_verify(
                     input_ids=input_ids,
                     draft_tokens=torch.cat(toks,dim=-1).unsqueeze(0)
                 )
                 breakpoint()
-
+                '''
                 # from torch.nn.attention import SDPBackend, sdpa_kernel
                 # with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
                 self._vocoder_diffusion_loop(audio_tokens,
@@ -378,7 +380,7 @@ class VitaStreaming():
         if not len(all_audio)==0:
             # logger.info(f"{output_data.shape=} {output_data[:20]=}")
             # logger.info(max(output_data))
-            output_data=np.concatenate(all_audio)
+            output_data=all_audio[0]#np.concatenate(all_audio)
             tensor = torch.from_numpy(output_data.astype("int16")).unsqueeze(0)  # (1, N)
 
             base_name = os.path.basename(audio_tensor).replace('mp3', 'wav')
@@ -395,7 +397,7 @@ class VitaStreaming():
 if __name__ == "__main__":
     
     vita=VitaStreaming()
-    audio_input = '/home/fit/renjujty/WORK/audios/0.wav'
+    audio_input = '/home/fit/renjujty/WORK/audios/1.wav'
     if audio_input is not None:
         for i in range(7):
             vita.run_infer_stream(audio_input,'/home/fit/renjujty/WORK/vita_temp/')
