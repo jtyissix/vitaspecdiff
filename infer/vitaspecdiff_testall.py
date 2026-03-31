@@ -19,6 +19,7 @@ from huggingface_hub import snapshot_download
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
 from transformers.generation import GenerationConfig
 from loguru import logger
+import logging
 from vita_audio.data.processor.audio_processor import add_audio_input_contiguous
 from vita_audio.tokenizer import get_audio_tokenizer
 target_model_name_or_path = "/home/fit/renjujty/jty/vita/models/vita_balance_official/"
@@ -531,8 +532,49 @@ class VitaStreaming():
             past_audio_token_len = len(audio_tokens)
             num_audio_chunk += 1
             takeover_ready=True
-        else:
+        elif num_accepted==2:
+            draft_toks,_=self.draft_model.draft_correct_and_generate(
+                input_ids=input_ids,
+                first_text_token=draft_toks[0].unsqueeze(0),
+                first_audio_tokens=torch.cat(draft_toks[1:5],dim=-1).unsqueeze(0),
+                corrected_text_token=accepted_tensor[1].unsqueeze(0).unsqueeze(0),
+                do_sample=False,
+            )
+            self._vocoder_abort.set()
             vocoder_prediffuse_task_1.result() # wait for vocoder to finish
+            this_step=10-min(0,self.audio_tokenizer.audio_decoder.flow.now_step)
+            self.audio_tokenizer.audio_decoder.flow.reset_step_cache(False,device='cuda')
+            self.audio_tokenizer.audio_decoder.flow.set_now_steps(10-this_step)
+            self._vocoder_abort.clear()
+            #breakpoint()
+            generated_text=self.draft_tokenizer.decode(torch.cat(draft_toks))
+            audio_tokens = extract_token_ids_as_int(generated_text)
+            vocoder_prediffuse_task_2=self.executor.submit(self.n_step_vocoder_worker,
+                        audio_tokens,
+                        prompt_audio_path,
+                        num_steps=this_step,
+                        t0=start_time
+                    )
+            tts_speech=vocoder_prediffuse_task_2.result()
+            new_tts_speech = tts_speech[past_tts_speech_len:]
+            tts_np = new_tts_speech.squeeze().float().cpu().numpy()
+            max_val = np.max(np.abs(tts_np))
+            if max_val > 0:
+                tts_np = tts_np / max_val  # 归一化到 [-1, 1]
+
+            output_data = (tts_np * 32767).astype(np.int16)
+            all_audio.append(output_data)
+            if num_audio_chunk == 0:
+                    first_audio_time = (
+                        time.perf_counter() - start_time
+                    )
+            logger.info(f"first audio chunk time: {first_audio_time}")
+            past_tts_speech_len = len(tts_speech)
+            past_audio_token_len = len(audio_tokens)
+            num_audio_chunk += 1
+            takeover_ready=True
+        else:
+            vocoder_prediffuse_task_1.result()
         if takeover_ready:
             seam_step=True
             target_toks=[]
@@ -613,7 +655,7 @@ class VitaStreaming():
 
 if __name__ == "__main__":
     vita=VitaStreaming()
-    audio_input = '/home/fit/renjujty/WORK/audios/727.wav'
+    audio_input = '/home/fit/renjujty/WORK/audios/9.wav'
     if audio_input is not None:
         for i in range(20):
             vita.run_infer_stream(audio_input,'/home/fit/renjujty/WORK/vita_temp/')
