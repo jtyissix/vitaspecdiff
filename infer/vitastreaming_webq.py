@@ -5,6 +5,7 @@ import re
 import sys
 import time
 import threading
+import csv
 from concurrent.futures import ThreadPoolExecutor,as_completed
 from threading import Thread
 from typing import Optional
@@ -18,8 +19,6 @@ from transformers.generation import GenerationConfig
 from loguru import logger
 from vita_audio.data.processor.audio_processor import add_audio_input_contiguous
 from vita_audio.tokenizer import get_audio_tokenizer
-#model_name_or_path = "/home/fit/renjujty/jty/vita/models/vita_0.5b_balance_final/"
-
 model_name_or_path = "/home/fit/renjujty/jty/vita/models/vita_balance_official/"
 device_map = "auto"
 sys.path.append("../third_party/GLM-4-Voice/")
@@ -49,13 +48,16 @@ message = ""
 torch_dtype = torch.bfloat16
 #---------------------------------------------------------
 
-def remove_audio_tokens(text):
-    pattern = re.compile(r"<\|audio_\d+\|>|<\|begin_of_audio\|>|<\|end_of_audio\|>|<\|im_end\|>")
-    return pattern.sub("", text)
+
 def extract_token_ids_as_int(text):
         pattern = re.compile(r"<\|audio_(\d+)\|>")
         token_ids = pattern.findall(text)
         return [int(id) for id in token_ids]
+
+
+def remove_audio_tokens(text):
+    pattern = re.compile(r"<\|audio_\d+\|>|<\|begin_of_audio\|>|<\|end_of_audio\|>")
+    return pattern.sub("", text)
 class TextAudioIteratorStreamer(TextIteratorStreamer):
     def __init__(
         self,
@@ -342,22 +344,18 @@ class VitaStreaming():
                     else:
                         continue
                 
-                breakpoint()
+                #breakpoint()
                 # from torch.nn.attention import SDPBackend, sdpa_kernel
                 # with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
-                self._vocoder_diffusion_loop(audio_tokens,
-                    source_speech_16k=prompt_audio_path,
-                    num_steps=5,t0=start_time)
-                '''
+                
+                
                 tts_speech = self.audio_tokenizer.decode(
                     audio_tokens,
                     source_speech_16k=prompt_audio_path,
                     option_steps=option_steps,
                 )
-                '''
-                tts_speech=self._vocoder_diffusion_loop(audio_tokens,
-                    source_speech_16k=prompt_audio_path,
-                    num_steps=5,t0=start_time)
+                
+                
                 option_steps = 10 #min(option_steps + 2, 10)
 
                 new_tts_speech = tts_speech[past_tts_speech_len:]
@@ -387,7 +385,6 @@ class VitaStreaming():
                     past_audio_token_len = 0
 
                 num_audio_chunk += 1
-        print(f"generated text: {remove_audio_tokens(generated_text)}")
         #breakpoint()
         if not len(all_audio)==0:
             # logger.info(f"{output_data.shape=} {output_data[:20]=}")
@@ -403,12 +400,91 @@ class VitaStreaming():
                 encoding="PCM_S",
                 bits_per_sample=16,
             )
+        return {"text":remove_audio_tokens(generated_text), 'audio': f"{output_dir}/{base_name}"},first_audio_time
 
 
 if __name__ == "__main__":
-    
+    import os, json, math
+
+    # ====== paths ======
+    audio_folder = "/home/fit/renjujty/WORK/dataset/web_questions/eval_datas/web_questions/audios"
+    time_json_path = "/home/fit/renjujty/WORK/jty/vita/json/specdiff_num_dict_webq.json"
+    # 只保存每个音频第一次生成的文本（jsonl，一行一个json），不存在会自动创建
+    text_jsonl_path = "/home/fit/renjujty/WORK/vita_temp/webq_baseline_audio/generated_text.jsonl"
+    audio_save_path= "/home/fit/renjujty/WORK/vita_temp/webq_baseline_audio/"
+    data_csv_path = "/home/fit/renjujty/WORK/dataset/web_questions/eval_datas/web_questions/web_questions.csv"
+    os.makedirs(os.path.dirname(text_jsonl_path), exist_ok=True)
     vita=VitaStreaming()
-    audio_input = '/home/fit/renjujty/WORK/audios/15.wav'
+    num_dict={}
+
+    
+
+    # ====== build audio list (optional: check existence) ======
+    audio_path_list = []
+    with open(data_csv_path, "r", newline="", encoding="utf-8") as f:
+        reader = csv.reader(f)
+
+        header = next(reader)  # 跳过表头
+
+        for row in reader:
+            wav_name = row[3]  # 假设第5列是 wav 文件名
+            wav_path = f"{audio_folder}/{wav_name}"
+        
+            audio_path_list.append(wav_path)
+
+    
+    print(f"Total {len(audio_path_list)} audios to test")
+
+    
+    total_time_list = []
+
+    # ====== evaluation loop ======
+    for i in range(len(audio_path_list)):
+        time_list = []
+
+        wav_path = audio_path_list[i]
+        print(f"[{i+1}/{len(audio_path_list)}] {wav_path}")
+
+        for j in range(10):
+            
+            
+            response, first_audio_time = vita.run_infer_stream(wav_path,audio_save_path)
+            time_list.append(first_audio_time)
+
+            # 只保存第一次（j == 0）的生成文本到 jsonl（文件会自动创建）
+            if j == 0:
+                with open(text_jsonl_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({
+                        "index": i,
+                        "wav_path": wav_path,
+                        "text": response.get("text", ""),
+                        "audio_output": response.get("audio", None)
+                    }, ensure_ascii=False) + "\n")
+                    f.flush()
+
+        # 取10次平均
+        mx = max(time_list)  # sum(time_list) / len(time_list)
+        total_time_list.append(mx)
+        print(f"avg time is {mx}")
+
+        # 每个音频都更新一次时间json（保持你原逻辑）
+        num_dict["all_baseline_time"] = total_time_list
+        with open(time_json_path, "w") as f:
+            json.dump(num_dict, f)
+
+    # ====== summary ======
+    print(len(total_time_list))
+    print(total_time_list)
+    print("average first audio time:", sum(total_time_list) / len(total_time_list))
+    print("fastest first audio time:", min(total_time_list))
+
+    # p90：用 ceil(0.9*n)-1，避免 int(0.9*n) 在小样本时偏到最大值
+    x_sorted = sorted(total_time_list)
+    p90_idx = max(0, math.ceil(0.9 * len(x_sorted)) - 1)
+    print("p90 first audio time:", x_sorted[p90_idx])
+    '''
+    audio_input = '/home/fit/renjujty/WORK/audios/1.wav'
     if audio_input is not None:
-        for i in range(20):
+        for i in range(7):
             vita.run_infer_stream(audio_input,'/home/fit/renjujty/WORK/vita_temp/')
+    '''

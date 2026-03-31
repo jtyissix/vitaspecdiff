@@ -9,12 +9,8 @@ then
     SEQ_LENGTH=32768
 fi
 
-timestamp="$2"
-if [ -z "$timestamp" ]
-then
-    timestamp=`date +'%Y%m%d_%H'`0000
-fi
 
+timestamp=20260326_113412
 ######################################################################
 export ROOT_PATH=/home/fit/renjujty/jty/vita/
 export CODE_PATH=${ROOT_PATH}/
@@ -59,9 +55,9 @@ echo Logging output to "$LOG"
 echo ${@}
 
 ######################################################################
-DATA_PATH=${LOCAL_CODE_PATH}/configs/sts_finetune_stage2.yaml
+DATA_PATH=${LOCAL_CODE_PATH}/configs/sts_finetune_stage1.yaml
 
-MODEL_NAME_OR_PATH=${ROOT_PATH}/output/LM/20260326_113412/
+MODEL_NAME_OR_PATH=${ROOT_PATH}/output/LM/20260324_184021/
 
 AUDIO_TOKENIZER_PATH=${ROOT_PATH}/models/THUDM/
 
@@ -79,8 +75,8 @@ DISTRIBUTED_ARGS="
 torchrun $DISTRIBUTED_ARGS tools/finetune_sts_v4_48_3.py \
     --log_level "info" \
     --do_train \
-    --overwrite_output_dir \
-    --config_name ${MODEL_NAME_OR_PATH} \
+    --resume_from_checkpoint /home/fit/renjujty/jty/vita/output/LM/20260326_113412/checkpoint-1600/ \
+    --config_name vita_audio/models/qwen2_mtp_v4_48_3/config_0.5B_mtp10.json \
     --tokenizer_name $MODEL_NAME_OR_PATH \
     --model_name_or_path $MODEL_NAME_OR_PATH \
     --audio_tokenizer_path $AUDIO_TOKENIZER_PATH \
@@ -91,16 +87,16 @@ torchrun $DISTRIBUTED_ARGS tools/finetune_sts_v4_48_3.py \
     --torch_dtype bfloat16 \
     --output_dir $OUTPUT_DIR \
     --num_train_epochs 1 \
-    --max_steps 4000 \
+    --max_steps 8000 \
     --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 1 \
     --gradient_accumulation_steps 16 \
     --save_strategy "steps" \
     --save_steps 0.1 \
     --save_total_limit 2 \
-    --learning_rate 5.00e-5 \
+    --learning_rate 1.00e-3 \
     --max_grad_norm 1.0 \
-    --weight_decay 0.1 \
+    --weight_decay 0.0 \
     --adam_beta1 0.9 \
     --adam_beta2 0.95 \
     --adam_epsilon 1e-8 \
@@ -110,7 +106,7 @@ torchrun $DISTRIBUTED_ARGS tools/finetune_sts_v4_48_3.py \
     --report_to "tensorboard" \
     --model_max_length ${SEQ_LENGTH} \
     --gradient_checkpointing True \
-    --deepspeed ${LOCAL_CODE_PATH}/scripts/deepspeed/ds_config_zero2_no_optimizer.json \
+    --deepspeed ${LOCAL_CODE_PATH}/scripts/deepspeed/ds_config_zero2_no_offload.json \
     --trust_remote_code False \
     --ddp_timeout 7200 \
     --ddp_backend ${DISTRIBUTED_BACKEND} \
@@ -122,7 +118,7 @@ torchrun $DISTRIBUTED_ARGS tools/finetune_sts_v4_48_3.py \
     --create_attention_mask false \
     --create_attention_mask_2d false \
     --dataloader_num_workers 4 \
-    --mtp_model_lr_mult 1.00e1 \
+    --language-model-freeze \
     --text-audio-interval-ratio 1 4 3 8 4 10 \
 
     #--language-model-freeze \

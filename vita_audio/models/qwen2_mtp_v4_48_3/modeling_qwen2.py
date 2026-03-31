@@ -1619,7 +1619,378 @@ class Qwen2MTPForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             mtp_inference_mode += "M" * main_num + "m" * mtp_num
 
         self.mtp_inference_mode = mtp_inference_mode
+    def draft_prefill_and_stream_generate(
+        self,
+        input_ids: torch.LongTensor,
+        first_text_token: torch.LongTensor,
+        first_audio_tokens: torch.LongTensor,
+        partial_text_tokens: Optional[torch.LongTensor],
+        second_audio_tokens: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        max_new_tokens: int = 512,
+        do_sample: bool = False,
+        temperature: float = 0.7,
+        top_k: int = 20,
+        top_p: float = 0.8,
+        repetition_penalty: float = 1.05,
+        eos_token_id: Optional[Union[int, List[int]]] = None,
+        return_past_key_values: bool = False,
+    ):
+        """
+        高效接管生成：backbone prefill → backbone 补 text → MTP 注入 audio → 正常接管。
 
+        ════════════════════════════════════════════════════════════════════
+        调度表 [1, 4, 3, 8, 4, 10]  →  M mmmm MMM mmmmmmmm MMMM mmmmmmmmmm ...
+        步骤:                         0 1234  567 89...  15 16..19 20..29
+        ════════════════════════════════════════════════════════════════════
+
+        Phase 1 — 一次 backbone prefill:
+            [prompt | t0 | a0-3 | 给定的 K 个 text]
+            schedule 位置走到 5+K，backbone KV 全部就位。
+
+        Phase 2 — backbone 逐个采样缺失 text (最多 2 次 forward):
+            每次 forward 走 M-mode (backbone, 28 层)。
+            最后一个采样出的 text token 不单独 forward，直接进 Phase 3。
+
+        Phase 3 — MTP 逐个注入 audio (每次只跑 1 层):
+            将 [last_text | a8 | a9 | ... | a14] 逐个喂 self.forward()。
+            每个 forward 自动路由到 MTP head（schedule 为 m），只跑 1 层。
+            最后 a15 的 forward 触发 schedule[16]=M → backbone catch-up:
+            backbone 一次性处理 8~9 个未见 token（mini-prefill，GPU 并行高效）。
+
+        Phase 4 — 正常自由生成:
+            与 stream_generate 完全一致的 yield 循环。
+            MTP 头在 Phase 3 已经 catch-up 完成，backbone 也已对齐。
+            生成从 step 16 无缝接管，和从未被接管时完全一样。
+
+        ════════════════════════════════════════════════════════════════════
+        Forward 次数:
+            K=3: 1 prefill + 8 fwd (7 MTP×1层 + 1 backbone catch-up) = 9
+            K=2: 1 prefill + 0 backbone + 9 fwd (8 MTP + 1 catch-up) = 10
+            K=1: 1 prefill + 1 backbone + 9 fwd = 11
+            K=0: 1 prefill + 2 backbone + 9 fwd = 12
+
+            其中 MTP forward 每次只跑 1 层，极快。
+            backbone catch-up 是 8-9 token 的 mini-prefill，GPU 并行高效。
+        ════════════════════════════════════════════════════════════════════
+
+        Yields:
+            第一次:   (all_draft_tokens [batch,16], filled_text [batch,3])
+            后续:     (next_tok, logits) 或 (next_tok, logits, past_kv)
+        """
+        assert not self.training, "请先调用 model.eval()"
+        assert self.mtp_inference_mode is not None, (
+            "请先调用 model._prepare_mtp_for_generation(mtp_inference_mode, max_new_tokens=8192)"
+        )
+
+        import torch.nn.functional as F
+
+        device     = input_ids.device
+        batch_size = input_ids.shape[0]
+        prompt_len = input_ids.shape[1]
+
+        # ── 归一化 eos ────────────────────────────────────────────────────
+        if eos_token_id is None:
+            eos_ids: set = set()
+        elif isinstance(eos_token_id, int):
+            eos_ids = {eos_token_id}
+        else:
+            eos_ids = set(eos_token_id)
+
+        # ── 归一化 draft tokens ───────────────────────────────────────────
+        if first_text_token.dim() == 1:
+            first_text_token = first_text_token.unsqueeze(1)
+        assert first_audio_tokens.shape[1] == 4
+        assert second_audio_tokens.shape[1] == 8
+
+        if partial_text_tokens is None or partial_text_tokens.numel() == 0:
+            K = 0
+            partial_text_tokens = None
+        else:
+            K = partial_text_tokens.shape[1]
+            assert 0 <= K <= 3
+        num_missing = 3 - K
+
+        # ── 重置 MTP 状态机 ──────────────────────────────────────────────
+        self.stream_resume_state = None
+        self.input_ids      = None
+        self.inputs_embeds  = None
+        self.hidden_states  = [None] * (self.config.num_nextn_predict_layers + 1)
+        self.position_ids   = None
+        self.attention_mask = None
+        self.mtp_idx        = -1
+        self.num_prefill_tokens = -1
+
+        past_kv = DynamicCache()
+
+        # ══════════════════════════════════════════════════════════════════
+        # Phase 1: Backbone prefill [prompt | t0 | a0-3 | 给定 text]
+        # ══════════════════════════════════════════════════════════════════
+        prefix_parts = [first_text_token, first_audio_tokens]       # 1 + 4
+        if K > 0:
+            prefix_parts.append(partial_text_tokens)                # + K
+        prefix    = torch.cat(prefix_parts, dim=1)                  # [batch, 5+K]
+        big_input = torch.cat([input_ids, prefix], dim=1)           # [batch, P+5+K]
+
+        total_prefill_len = big_input.shape[1]
+        cache_position = torch.arange(0, total_prefill_len, device=device)
+        position_ids   = cache_position.unsqueeze(0)
+
+        if attention_mask is None:
+            cur_mask = torch.ones(batch_size, total_prefill_len,
+                                  dtype=torch.long, device=device)
+        else:
+            cur_mask = torch.cat(
+                [attention_mask,
+                 torch.ones(batch_size, prefix.shape[1],
+                            dtype=attention_mask.dtype, device=device)],
+                dim=1,
+            )
+
+        with torch.no_grad():
+            out = self(
+                input_ids=big_input,
+                attention_mask=cur_mask,
+                position_ids=position_ids,
+                cache_position=cache_position,
+                past_key_values=past_kv,
+                use_cache=True,
+                num_logits_to_keep=1,
+                return_dict=True,
+            )
+
+        logits  = out.logits[:, -1, :]
+        past_kv = out.past_key_values
+
+        # ── 修正 num_prefill_tokens 使 num_decode_tokens 对齐调度表 ───────
+        # forward() 首次设置 num_prefill_tokens = P+5+K
+        # 改为 P，则 num_decode_tokens = (P+5+K) - P = 5+K
+        # 恰好等于已注入的 draft token 数（schedule 位置正确）
+        self.num_prefill_tokens = prompt_len
+        next_pos = total_prefill_len
+
+        # ══════════════════════════════════════════════════════════════════
+        # Phase 2: Backbone 逐步采样缺失 text tokens
+        #
+        # 例 K=0: prefill 含 5 draft → logits 预测 t5
+        #   采样 t5 → forward(t5) backbone → logits 预测 t6
+        #   采样 t6 → forward(t6) backbone → logits 预测 t7
+        #   采样 t7 → 不 forward，留给 Phase 3 的 MTP
+        #
+        # 例 K=2: prefill 含 7 draft → logits 预测 t7
+        #   采样 t7 → 不 forward，直接进 Phase 3
+        # ══════════════════════════════════════════════════════════════════
+        sampled_text = []
+
+        for i in range(num_missing):
+            # ── 采样 ─────────────────────────────────────────────────────
+            sample_logits = logits.clone()
+            if repetition_penalty != 1.0 and self.input_ids is not None:
+                for b in range(batch_size):
+                    seen = self.input_ids[b].unique()
+                    rp = sample_logits[b, seen]
+                    sample_logits[b, seen] = torch.where(
+                        rp < 0, rp * repetition_penalty,
+                        rp / repetition_penalty
+                    )
+
+            if do_sample:
+                tok = self._sample_logits(sample_logits, temperature, top_k, top_p)
+            else:
+                tok = sample_logits.argmax(dim=-1)
+            sampled_text.append(tok)                                # [batch]
+
+            # 最后一个采样的 text token 不 forward，留给 Phase 3 第一步
+            if i == num_missing - 1:
+                break
+
+            # 中间 text token 需要 forward（backbone）获取下一步 logits
+            cache_position = torch.tensor([next_pos], device=device)
+            position_ids   = cache_position.unsqueeze(0)
+            next_pos += 1
+            cur_mask = torch.cat(
+                [cur_mask, torch.ones(batch_size, 1,
+                                      dtype=cur_mask.dtype, device=device)],
+                dim=1,
+            )
+
+            with torch.no_grad():
+                out = self(
+                    input_ids=tok.unsqueeze(1),
+                    attention_mask=cur_mask,
+                    position_ids=position_ids,
+                    cache_position=cache_position,
+                    past_key_values=past_kv,
+                    use_cache=True,
+                    num_logits_to_keep=1,
+                    return_dict=True,
+                )
+            logits  = out.logits[:, -1, :]
+            past_kv = out.past_key_values
+
+        # ══════════════════════════════════════════════════════════════════
+        # Phase 3: MTP 逐个注入 audio tokens
+        #
+        # 构建逐个喂入的 token 列表:
+        #   K < 3: [last_sampled_text, a8, a9, ..., a14, a15]  → 9 个
+        #   K = 3: [a8, a9, ..., a14, a15]                     → 8 个
+        #
+        # 每个 token 通过 self.forward() 喂入:
+        #   - schedule 为 m 的步骤 → 自动路由到 MTP 头（只跑 1 层，极快）
+        #   - MTP 头首次调用时自动 catch-up 所有历史 hidden_states
+        #   - a15 的 forward 触发 schedule[16]=M → backbone 自动 catch-up
+        #     一次性处理 8~9 个未见 token（mini-prefill）
+        # ══════════════════════════════════════════════════════════════════
+        tokens_to_feed = []
+        if sampled_text:
+            tokens_to_feed.append(sampled_text[-1])                 # last text
+        for j in range(8):
+            tokens_to_feed.append(second_audio_tokens[:, j])        # a8..a15
+
+        for tok in tokens_to_feed:
+            cache_position = torch.tensor([next_pos], device=device)
+            position_ids   = cache_position.unsqueeze(0)
+            next_pos += 1
+            cur_mask = torch.cat(
+                [cur_mask, torch.ones(batch_size, 1,
+                                      dtype=cur_mask.dtype, device=device)],
+                dim=1,
+            )
+
+            with torch.no_grad():
+                out = self(
+                    input_ids=tok.unsqueeze(1) if tok.dim() == 1 else tok,
+                    attention_mask=cur_mask,
+                    position_ids=position_ids,
+                    cache_position=cache_position,
+                    past_key_values=past_kv,
+                    use_cache=True,
+                    num_logits_to_keep=1,
+                    return_dict=True,
+                )
+            logits  = out.logits[:, -1, :]
+            past_kv = out.past_key_values
+
+        # ── 此时状态 ─────────────────────────────────────────────────────
+        # • self.input_ids = [prompt | 16 draft tokens], len = P+16
+        # • backbone KV: 全部 P+16 token（a15 触发的 catch-up 已补齐）
+        # • MTP KV: heads 0-7 已 catch-up 完成
+        # • hidden_states[0]: 包含所有 backbone hidden states
+        # • logits: 预测 step 16 token
+        # • num_decode_tokens = 16, schedule[16] = M ← 正常生成起点
+
+        # ══════════════════════════════════════════════════════════════════
+        # 组装 draft 结果并 yield
+        # ══════════════════════════════════════════════════════════════════
+        text_parts = []
+        if K > 0:
+            text_parts.append(partial_text_tokens)
+        if sampled_text:
+            text_parts.append(torch.stack(sampled_text, dim=1))
+        filled_text = torch.cat(text_parts, dim=1) if text_parts else partial_text_tokens
+
+        all_draft = torch.cat([
+            first_text_token,                                       # [batch, 1]
+            first_audio_tokens,                                     # [batch, 4]
+            filled_text,                                            # [batch, 3]
+            second_audio_tokens,                                    # [batch, 8]
+        ], dim=1)                                                   # [batch, 16]
+
+        yield all_draft, filled_text
+
+        # ══════════════════════════════════════════════════════════════════
+        # Phase 4: 正常自由生成 (step 16+)
+        #
+        # 与 stream_generate 完全一致。此时所有 cache / hidden_states /
+        # mtp_idx / num_decode_tokens 都已正确对齐，和「从未被接管、
+        # 由大模型自己生成了 16 步」的状态完全等价。
+        # ══════════════════════════════════════════════════════════════════
+        NUM_DRAFT_STEPS = 16
+        max_free_tokens = max_new_tokens - NUM_DRAFT_STEPS
+        if max_free_tokens <= 0:
+            return
+
+        effective_mode = self.mtp_inference_mode[NUM_DRAFT_STEPS : max_new_tokens]
+        finished  = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        free_step = 0
+
+        for mode_char in effective_mode:
+            # ── 重复惩罚 ─────────────────────────────────────────────────
+            if repetition_penalty != 1.0 and self.input_ids is not None:
+                for b in range(batch_size):
+                    seen = self.input_ids[b].unique()
+                    rp   = logits[b, seen]
+                    logits[b, seen] = torch.where(
+                        rp < 0, rp * repetition_penalty,
+                        rp / repetition_penalty
+                    )
+
+            # ── 采样 ─────────────────────────────────────────────────────
+            if do_sample:
+                next_tok = self._sample_logits(logits, temperature, top_k, top_p)
+            else:
+                next_tok = logits.argmax(dim=-1)
+
+            next_input = next_tok.unsqueeze(1)
+            next_mask  = torch.cat(
+                [cur_mask,
+                 torch.ones(batch_size, 1,
+                            dtype=cur_mask.dtype, device=device)],
+                dim=1,
+            )
+
+            # ── resume state（可被 stream_generate 继续）─────────────────
+            self.stream_resume_state = {
+                "input_ids":         self.input_ids,
+                "inputs_embeds":     self.inputs_embeds,
+                "hidden_states":     self.hidden_states,
+                "position_ids":      self.position_ids,
+                "attention_mask":    self.attention_mask,
+                "mtp_idx":           self.mtp_idx,
+                "num_prefill_tokens":self.num_prefill_tokens,
+                "cur_input":         next_input,
+                "cur_mask":          next_mask,
+                "next_pos":          next_pos,
+                "steps_done":        NUM_DRAFT_STEPS + free_step + 1,
+            }
+
+            # ── yield ────────────────────────────────────────────────────
+            if return_past_key_values:
+                yield next_tok, logits, past_kv
+            else:
+                yield next_tok, logits
+
+            # ── EOS ──────────────────────────────────────────────────────
+            if eos_ids:
+                finished |= torch.tensor(
+                    [t.item() in eos_ids for t in next_tok],
+                    dtype=torch.bool, device=device,
+                )
+                if finished.all():
+                    break
+
+            free_step += 1
+
+            # ── forward 下一步 ───────────────────────────────────────────
+            cache_position = torch.tensor([next_pos], device=device)
+            position_ids   = cache_position.unsqueeze(0)
+            next_pos += 1
+
+            with torch.no_grad():
+                out = self(
+                    input_ids=next_input,
+                    attention_mask=next_mask,
+                    position_ids=position_ids,
+                    cache_position=cache_position,
+                    past_key_values=past_kv,
+                    use_cache=True,
+                    num_logits_to_keep=1,
+                    return_dict=True,
+                )
+
+            logits  = out.logits[:, -1, :]
+            past_kv = out.past_key_values
+            cur_mask = next_mask
     def _prepare_cache_for_generation(self, *args, **kwargs):
 
         generation_config = args[0]

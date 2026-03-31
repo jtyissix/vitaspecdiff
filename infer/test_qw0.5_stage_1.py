@@ -6,7 +6,7 @@ import sys
 import time
 from threading import Thread
 from typing import Optional
-
+import vita_audio.models
 import numpy as np
 import torch
 import torchaudio
@@ -30,7 +30,7 @@ def get_args():
 # init parms
 args = get_args()
 
-model_name_or_path = "/home/fit/renjujty/WORK/jty/vita/models/vita_0.5b_balance_stage1/"
+model_name_or_path = "/home/fit/renjujty/WORK/jty/vita/models/vita_0.5b_balance_stage3/"
 
 device_map = "auto"
 
@@ -56,7 +56,51 @@ audio_tokenizer = get_audio_tokenizer(
     rank=audio_tokenizer_rank,
 )
 audio_tokenizer.load_model(load_flow_trt=True,trt_path='/home/fit/renjujty/WORK/jty/vita/models/Decoder_trt/flow.decoder.estimator.fp32.a800.plan')
+def _vocoder_diffusion_loop(
+        
+        audio_tokens,
+        source_speech_16k,
+        num_steps: int,
+        
+        t0=None
+    ) :
+        """
+        Execute ``num_steps`` vocoder diffusion steps **sequentially**
+        inside a single background thread.
 
+        Before every step we poll ``self._vocoder_abort``.  If it has
+        been set (draft was rejected), we:
+          1. Exit the loop immediately.
+          2. Reset the vocoder streaming state so the *next* chunk
+             starts from a clean cache.
+          3. Return ``None`` to signal "no usable audio produced".
+
+        The ``is_last_speech_chunk`` flag is forwarded only on the very
+        last step of the very last chunk, matching CosyVoice2's
+        expected call convention.
+
+        Returns
+        -------
+        dict or None
+            Vocoder output containing ``tts_speech`` on success,
+            or ``None`` if the loop was aborted.
+        """
+        #result: Optional[dict] = None
+
+        for step in range(num_steps):
+            # ── cooperative abort check ──────────────────────────────
+            
+            
+            
+            # is_last_speech_chunk only on the *final* step of the
+            # *final* chunk — otherwise the vocoder won't flush its
+            # internal state prematurely.
+            #final_flag = is_last_speech_chunk and (step == num_steps - 1)
+            print('time from t0 to vocoder one step:',time.perf_counter()-t0)
+            result = audio_tokenizer.decode_one_step(
+                    audio_tokens,
+                    source_speech_16k=source_speech_16k)
+        return result
 chat_template = """
 {%- if tools %}\n    {{- '<|im_start|>system\\n' }}\n    {%- if messages[0]['role'] == 'system' %}\n        {{- messages[0]['content'] }}\n    {%- endif %}\n    {{- \"\\n\\n# Tools\\n\\nYou may call one or more functions to assist with the user query.\\n\\nYou are provided with function signatures within <tools></tools> XML tags:\\n<tools>\" }}\n    {%- for tool in tools %}\n        {{- \"\\n\" }}\n        {{- tool | tojson }}\n    {%- endfor %}\n    {{- \"\\n</tools>\\n\\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\\n<tool_call>\\n{\\\"name\\\": <function-name>, \\\"arguments\\\": <args-json-object>}\\n</tool_call><|im_end|>\\n\" }}\n{%- else %}\n    {%- if messages[0]['role'] == 'system' %}\n        {{- '<|im_start|>system\\n' + messages[0]['content'] + '<|im_end|>\\n' }}\n    {%- endif %}\n{%- endif %}\n{%- for message in messages %}\n    {%- if (message.role == \"user\") or (message.role == \"system\" and not loop.first) or (message.role == \"assistant\" and not message.tool_calls) %}\n        {{- '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>' + '\\n' }}\n    {%- elif message.role == \"assistant\" %}\n        {{- '<|im_start|>' + message.role }}\n        {%- if message.content %}\n            {{- '\\n' + message.content }}\n        {%- endif %}\n        {%- for tool_call in message.tool_calls %}\n            {%- if tool_call.function is defined %}\n                {%- set tool_call = tool_call.function %}\n            {%- endif %}\n            {{- '\\n<tool_call>\\n{\"name\": \"' }}\n            {{- tool_call.name }}\n            {{- '\", \"arguments\": ' }}\n            {{- tool_call.arguments | tojson }}\n            {{- '}\\n</tool_call>' }}\n        {%- endfor %}\n        {{- '<|im_end|>\\n' }}\n    {%- elif message.role == \"tool\" %}\n        {%- if (loop.index0 == 0) or (messages[loop.index0 - 1].role != \"tool\") %}\n            {{- '<|im_start|>user' }}\n        {%- endif %}\n        {{- '\\n<tool_response>\\n' }}\n        {{- message.content }}\n        {{- '\\n</tool_response>' }}\n        {%- if loop.last or (messages[loop.index0 + 1].role != \"tool\") %}\n            {{- '<|im_end|>\\n' }}\n        {%- endif %}\n    {%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}\n    {{- '<|im_start|>assistant\\n' }}\n{%- endif %}\n
 """
@@ -81,7 +125,7 @@ tokenizer = AutoTokenizer.from_pretrained(
 
 model = AutoModelForCausalLM.from_pretrained(
     model_name_or_path,
-    trust_remote_code=True,
+    trust_remote_code=False,
     device_map=device_map,
     torch_dtype=torch_dtype,
     attn_implementation="flash_attention_2",
@@ -217,7 +261,7 @@ def run_infer_stream(audio_tensor,output_dir):
         messages = system_message + [
             {
                 "role": "user",
-                "content": "Convert the text to speech.\nChinese will be growing to be world number one!",
+                "content": "Convert the text to speech.\nChina, officially the People's Republic of China (PRC), is a country in East Asia. It is the second-most populous country after India, with a population exceeding 1.4 billion, representing 17% of the world's population. China borders fourteen countries by land across an area of 9.6 million square kilometers (3,700,000 sq mi), making it the third-largest country by area. The country is divided into 33 province-level divisions: 22 provinces, 5 autonomous regions, 4 municipalities, and 2 semi-autonomous special administrative regions. Beijing is the capital, while Shanghai is the most populous city by urban area and largest financial center.",
             },
         ]
 
@@ -278,6 +322,7 @@ def run_infer_stream(audio_tensor,output_dir):
         
         if "<|end_of_audio|>" == new_text:
             #breakpoint()
+            audio_tokenizer.audio_decoder.flow.reset_step_cache(True,device='cuda')
             audio_tokens = extract_token_ids_as_int(generated_text)
             #print(f"{generated_text=}")
             if 'boost' in model_name_or_path:
@@ -295,14 +340,12 @@ def run_infer_stream(audio_tensor,output_dir):
                 else:
                     continue
              
-            breakpoint()
+            #breakpoint()
             # from torch.nn.attention import SDPBackend, sdpa_kernel
             # with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
-            tts_speech = audio_tokenizer.decode(
-                audio_tokens,
-                source_speech_16k=prompt_audio_path,
-                option_steps=option_steps,
-            )
+            tts_speech = _vocoder_diffusion_loop(audio_tokens,
+                    source_speech_16k=prompt_audio_path,
+                    num_steps=10,t0=start_time)
             option_steps = 10 #min(option_steps + 2, 10)
 
             new_tts_speech = tts_speech[past_tts_speech_len:]
