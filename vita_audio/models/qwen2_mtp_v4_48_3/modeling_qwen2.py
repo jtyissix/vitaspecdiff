@@ -1991,6 +1991,331 @@ class Qwen2MTPForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             logits  = out.logits[:, -1, :]
             past_kv = out.past_key_values
             cur_mask = next_mask
+    def draft_correct_and_generate(
+        self,
+        input_ids: torch.LongTensor,
+        first_text_token: torch.LongTensor,
+        first_audio_tokens: torch.LongTensor,
+        corrected_text_token: torch.LongTensor,
+        do_sample: bool = False,
+        temperature: float = 0.7,
+        top_k: int = 20,
+        top_p: float = 0.8,
+        repetition_penalty: float = 1.05,
+    ):
+        """
+        accepted_num==2: 纠正 draft cache, 重新生成后续 token, 返回完整 16 token list。
+
+        调度表 [1,4,3,8]  →  M mmmm MMM mmmmmmmm
+        步骤:               0 1234  567 89…15
+
+        已有 (prefill):  t0(0) a0-a3(1-4) t5_corrected(5)
+        需生成:          t6(6) t7(7) a8-a15(8-15)
+
+        Returns
+        -------
+        all_toks : list[Tensor], 长度 16, 每个元素 shape [1], 与 stream_generate 格式一致
+        all_logits : list[Tensor], 长度 16, 前 6 个为 None, 后 10 个 shape [1, V]
+        """
+        assert not self.training
+        assert self.mtp_inference_mode is not None
+
+        device = input_ids.device
+        batch_size = input_ids.shape[0]
+        prompt_len = input_ids.shape[1]
+
+        # ── 重置 MTP 状态机 ──────────────────────────────────────────────
+        self.stream_resume_state = None
+        self.input_ids     = None
+        self.inputs_embeds = None
+        self.hidden_states = [None] * (self.config.num_nextn_predict_layers + 1)
+        self.position_ids  = None
+        self.attention_mask = None
+        self.mtp_idx       = -1
+        self.num_prefill_tokens = -1
+
+        past_kv = DynamicCache()
+
+        # 收集新生成的 token 和 logits
+        gen_toks = []      # 长度最终 = 10 (t6, t7, a8-a15)
+        gen_logits = []    # 长度最终 = 10
+
+        # ══════════════════════════════════════════════════════════════════
+        # Phase 1: Prefill [prompt | t0 | a0-a3 | t5_corrected]
+        # ══════════════════════════════════════════════════════════════════
+        prefix = torch.cat([first_text_token, first_audio_tokens,
+                            corrected_text_token], dim=1)          # [1, 6]
+        big_input = torch.cat([input_ids, prefix], dim=1)          # [1, P+6]
+
+        total_prefill_len = big_input.shape[1]
+        cache_position = torch.arange(0, total_prefill_len, device=device)
+        position_ids = cache_position.unsqueeze(0)
+        cur_mask = torch.ones(batch_size, total_prefill_len,
+                              dtype=torch.long, device=device)
+
+        with torch.no_grad():
+            out = self(
+                input_ids=big_input,
+                attention_mask=cur_mask,
+                position_ids=position_ids,
+                cache_position=cache_position,
+                past_key_values=past_kv,
+                use_cache=True,
+                num_logits_to_keep=1,
+                return_dict=True,
+            )
+        logits = out.logits[:, -1, :]      # [1, V]
+        past_kv = out.past_key_values
+        self.num_prefill_tokens = prompt_len
+        next_pos = total_prefill_len
+
+        # ══════════════════════════════════════════════════════════════════
+        # Phase 2: Backbone 采样 t6, t7 (步骤 6-7)
+        # ══════════════════════════════════════════════════════════════════
+        for i in range(2):
+            sample_logits = logits.clone()
+            if repetition_penalty != 1.0 and self.input_ids is not None:
+                for b in range(batch_size):
+                    seen = self.input_ids[b].unique()
+                    rp = sample_logits[b, seen]
+                    sample_logits[b, seen] = torch.where(
+                        rp < 0, rp * repetition_penalty,
+                        rp / repetition_penalty
+                    )
+
+            if do_sample:
+                tok = self._sample_logits(sample_logits, temperature, top_k, top_p)
+            else:
+                tok = sample_logits.argmax(dim=-1)     # [1]
+
+            gen_toks.append(tok)
+            gen_logits.append(logits.clone())
+
+            # t7 不 forward，留给 Phase 3
+            if i == 1:
+                break
+
+            # t6 forward
+            cache_position = torch.tensor([next_pos], device=device)
+            position_ids = cache_position.unsqueeze(0)
+            next_pos += 1
+            cur_mask = torch.cat(
+                [cur_mask, torch.ones(batch_size, 1,
+                                      dtype=cur_mask.dtype, device=device)], dim=1)
+            with torch.no_grad():
+                out = self(
+                    input_ids=tok.view(1, 1),
+                    attention_mask=cur_mask,
+                    position_ids=position_ids,
+                    cache_position=cache_position,
+                    past_key_values=past_kv,
+                    use_cache=True,
+                    num_logits_to_keep=1,
+                    return_dict=True,
+                )
+            logits = out.logits[:, -1, :]
+            past_kv = out.past_key_values
+
+        # ══════════════════════════════════════════════════════════════════
+        # Phase 3: MTP 生成 a8-a15 (步骤 8-15)
+        #   喂 t7 → 采样 a8, 喂 a8 → 采样 a9, ..., 喂 a14 → 采样 a15
+        # ══════════════════════════════════════════════════════════════════
+        cur_tok = gen_toks[-1]    # t7, shape [1]
+
+        for step in range(8):
+            cache_position = torch.tensor([next_pos], device=device)
+            position_ids = cache_position.unsqueeze(0)
+            next_pos += 1
+            cur_mask = torch.cat(
+                [cur_mask, torch.ones(batch_size, 1,
+                                      dtype=cur_mask.dtype, device=device)], dim=1)
+
+            with torch.no_grad():
+                out = self(
+                    input_ids=cur_tok.view(1, 1),
+                    attention_mask=cur_mask,
+                    position_ids=position_ids,
+                    cache_position=cache_position,
+                    past_key_values=past_kv,
+                    use_cache=True,
+                    num_logits_to_keep=1,
+                    return_dict=True,
+                )
+            logits = out.logits[:, -1, :]
+            past_kv = out.past_key_values
+
+            sample_logits = logits.clone()
+            if repetition_penalty != 1.0 and self.input_ids is not None:
+                for b in range(batch_size):
+                    seen = self.input_ids[b].unique()
+                    rp = sample_logits[b, seen]
+                    sample_logits[b, seen] = torch.where(
+                        rp < 0, rp * repetition_penalty,
+                        rp / repetition_penalty
+                    )
+
+            if do_sample:
+                cur_tok = self._sample_logits(sample_logits, temperature, top_k, top_p)
+            else:
+                cur_tok = sample_logits.argmax(dim=-1)    # [1]
+
+            gen_toks.append(cur_tok)
+            gen_logits.append(logits.clone())
+
+        # ══════════════════════════════════════════════════════════════════
+        # 组装: 前 6 个已有 + 后 10 个新生成 = 16
+        # ══════════════════════════════════════════════════════════════════
+        all_toks = []
+        all_toks.append(first_text_token.view(-1))                  # t0,  [1]
+        for i in range(4):
+            all_toks.append(first_audio_tokens[0, i].unsqueeze(0))  # a0-a3, 各 [1]
+        all_toks.append(corrected_text_token.view(-1))              # t5c, [1]
+        all_toks.extend(gen_toks)                                   # t6,t7,a8-a15, 各 [1]
+
+        all_logits = [None] * 6 + gen_logits                        # 前 6 个 None
+
+        return all_toks, all_logits
+    def target_correct_and_generate(
+        self,
+        input_ids: torch.LongTensor,
+        first_text_token: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        do_sample: bool = False,
+        temperature: float = 0.7,
+        top_k: int = 20,
+        top_p: float = 0.8,
+        repetition_penalty: float = 1.05,
+    ) -> "Tuple[torch.LongTensor, torch.LongTensor]":
+        """
+        在只给定第 1 个 text token 的前提下，继续生成：
+        4 个 audio token + 1 个 text token。
+
+        该函数会保持原有 MTP 调度位置不变：
+        - 先 prefill [prompt | first_text_token]
+        - 再按现有 self.forward() 状态机逐步生成 5 个 token
+        这样 audio token 仍然在它原本应由 MTP 生成的位置产生。
+
+        Returns
+        -------
+        generated_5_tokens: [batch, 5]
+            顺序为 [a0, a1, a2, a3, t1]。
+        next_text_token: [batch, 1]
+            generated_5_tokens 的最后一个 text token（即 t1）。
+        """
+        assert not self.training, "请先调用 model.eval()"
+        assert self.mtp_inference_mode is not None, (
+            "请先调用 model._prepare_mtp_for_generation(mtp_inference_mode, max_new_tokens=8192)"
+        )
+
+        device = input_ids.device
+        batch_size = input_ids.shape[0]
+        prompt_len = input_ids.shape[1]
+
+        if first_text_token.dim() == 1:
+            first_text_token = first_text_token.unsqueeze(1)
+        assert first_text_token.shape[1] == 1, "first_text_token 只能提供 1 个 token"
+
+        # ── 重置 MTP 状态机 ──────────────────────────────────────────────
+        self.stream_resume_state = None
+        self.input_ids = None
+        self.inputs_embeds = None
+        self.hidden_states = [None] * (self.config.num_nextn_predict_layers + 1)
+        self.position_ids = None
+        self.attention_mask = None
+        self.mtp_idx = -1
+        self.num_prefill_tokens = -1
+
+        past_kv = DynamicCache()
+
+        # Phase 1: Backbone prefill [prompt | t0]
+        prefill_input = torch.cat([input_ids, first_text_token], dim=1)
+        total_prefill_len = prefill_input.shape[1]
+        cache_position = torch.arange(0, total_prefill_len, device=device)
+        position_ids = cache_position.unsqueeze(0)
+
+        if attention_mask is None:
+            cur_mask = torch.ones(batch_size, total_prefill_len, dtype=torch.long, device=device)
+        else:
+            cur_mask = torch.cat(
+                [
+                    attention_mask,
+                    torch.ones(batch_size, 1, dtype=attention_mask.dtype, device=device),
+                ],
+                dim=1,
+            )
+
+        with torch.no_grad():
+            out = self(
+                input_ids=prefill_input,
+                attention_mask=cur_mask,
+                position_ids=position_ids,
+                cache_position=cache_position,
+                past_key_values=past_kv,
+                use_cache=True,
+                num_logits_to_keep=1,
+                return_dict=True,
+            )
+
+        logits = out.logits[:, -1, :]
+        past_kv = out.past_key_values
+
+        # 只把 prompt 记为 prefill，使调度从“已注入 1 个 token”开始
+        self.num_prefill_tokens = prompt_len
+        next_pos = total_prefill_len
+
+        generated_tokens = []
+        steps_to_generate = 5  # 4 audio + 1 text
+
+        for _ in range(steps_to_generate):
+            sample_logits = logits.clone()
+            if repetition_penalty != 1.0 and self.input_ids is not None:
+                for b in range(batch_size):
+                    seen = self.input_ids[b].unique()
+                    rp = sample_logits[b, seen]
+                    sample_logits[b, seen] = torch.where(
+                        rp < 0, rp * repetition_penalty, rp / repetition_penalty
+                    )
+
+            if do_sample:
+                tok = self._sample_logits(sample_logits, temperature, top_k, top_p)
+            else:
+                tok = sample_logits.argmax(dim=-1)
+
+            generated_tokens.append(tok)
+
+            # 最后一个 token（text）不需要再前向
+            if len(generated_tokens) == steps_to_generate:
+                break
+
+            cache_position = torch.tensor([next_pos], device=device)
+            position_ids = cache_position.unsqueeze(0)
+            next_pos += 1
+            cur_mask = torch.cat(
+                [
+                    cur_mask,
+                    torch.ones(batch_size, 1, dtype=cur_mask.dtype, device=device),
+                ],
+                dim=1,
+            )
+
+            with torch.no_grad():
+                out = self(
+                    input_ids=tok.unsqueeze(1),
+                    attention_mask=cur_mask,
+                    position_ids=position_ids,
+                    cache_position=cache_position,
+                    past_key_values=past_kv,
+                    use_cache=True,
+                    num_logits_to_keep=1,
+                    return_dict=True,
+                )
+
+            logits = out.logits[:, -1, :]
+            past_kv = out.past_key_values
+
+        generated_5_tokens = torch.stack(generated_tokens, dim=1)
+        next_text_token = generated_5_tokens[:, -1:].contiguous()
+        return generated_5_tokens, next_text_token
     def _prepare_cache_for_generation(self, *args, **kwargs):
 
         generation_config = args[0]

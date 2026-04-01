@@ -410,14 +410,14 @@ if __name__ == "__main__":
 
     # ====== paths ======
     audio_folder = "/home/fit/renjujty/WORK/dataset/aplca/eval_datas/alpaca_eval/audios"
-    time_json_path = "/home/fit/renjujty/WORK/jty/vita/json/specdiff_num_dict_alp.json"
+    #time_json_path = "/home/fit/renjujty/WORK/jty/vita/json/specdiff_num_dict_alp.json"
     # 只保存每个音频第一次生成的文本（jsonl，一行一个json），不存在会自动创建
     text_jsonl_path = "/home/fit/renjujty/WORK/vita_temp/alp_baseline_audio/generated_text.jsonl"
     audio_save_path= "/home/fit/renjujty/WORK/vita_temp/alp_baseline_audio/"
     data_csv_path = "/home/fit/renjujty/WORK/dataset/aplca/eval_datas/alpaca_eval/alpaca_eval.csv"
     os.makedirs(os.path.dirname(text_jsonl_path), exist_ok=True)
     vita=VitaStreaming()
-    num_dict={}
+    
 
     
 
@@ -447,7 +447,7 @@ if __name__ == "__main__":
         wav_path = audio_path_list[i]
         print(f"[{i+1}/{len(audio_path_list)}] {wav_path}")
 
-        for j in range(10):
+        for j in range(1):
             
             
             response, first_audio_time = vita.run_infer_stream(wav_path,audio_save_path)
@@ -464,29 +464,6 @@ if __name__ == "__main__":
                     }, ensure_ascii=False) + "\n")
                     f.flush()
 
-        # 取10次平均
-        mx = max(time_list)  # sum(time_list) / len(time_list)
-        total_time_list.append(mx)
-        print(f"avg time is {mx}")
+        
 
-        # 每个音频都更新一次时间json（保持你原逻辑）
-        num_dict["all_baseline_time"] = total_time_list
-        with open(time_json_path, "w") as f:
-            json.dump(num_dict, f)
-
-    # ====== summary ======
-    print(len(total_time_list))
-    print(total_time_list)
-    print("average first audio time:", sum(total_time_list) / len(total_time_list))
-    print("fastest first audio time:", min(total_time_list))
-
-    # p90：用 ceil(0.9*n)-1，避免 int(0.9*n) 在小样本时偏到最大值
-    x_sorted = sorted(total_time_list)
-    p90_idx = max(0, math.ceil(0.9 * len(x_sorted)) - 1)
-    print("p90 first audio time:", x_sorted[p90_idx])
-    '''
-    audio_input = '/home/fit/renjujty/WORK/audios/1.wav'
-    if audio_input is not None:
-        for i in range(7):
-            vita.run_infer_stream(audio_input,'/home/fit/renjujty/WORK/vita_temp/')
-    '''
+    
