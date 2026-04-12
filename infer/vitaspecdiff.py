@@ -391,13 +391,13 @@ class VitaStreaming():
                 encoding="PCM_S",
                 bits_per_sample=16,
             )
-        
+        print(generated_text)
 
 
 if __name__ == "__main__":
     
     vita=VitaStreaming()
-    audio_input = '/home/fit/renjujty/WORK/audios/1.wav'
+    audio_input = '/home/fit/renjujty/WORK/audios/0.wav'
     if audio_input is not None:
         for i in range(7):
             vita.run_infer_stream(audio_input,'/home/fit/renjujty/WORK/vita_temp/')

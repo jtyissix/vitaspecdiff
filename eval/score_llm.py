@@ -134,7 +134,7 @@ def main():
     parser.add_argument("--sleep", type=float, default=0.0)
     args = parser.parse_args()
 
-    pred_path = "/home/fit/renjujty/WORK/vita_temp/alp_our_audio/generated_text.jsonl"
+    pred_path = "/home/fit/renjujty/WORK/vita_temp/alp_SD_audio/generated_text.jsonl"
     data_csv_path = "/home/fit/renjujty/WORK/dataset/aplca/eval_datas/alpaca_eval/alpaca_eval.csv"
 
     data: List[Dict[str, Any]] = []

@@ -1278,6 +1278,173 @@ class Qwen2MTPForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
+
+
+    def draft_generate_for_sd(
+        self,
+        input_ids: torch.LongTensor,
+        confirmed_prefix: torch.LongTensor,
+        n_to_generate: int,
+        do_sample: bool = False,
+        temperature: float = 0.7,
+        top_k: int = 20,
+        top_p: float = 0.8,
+        repetition_penalty: float = 1.05,
+    ):
+        """
+        纯投机解码 helper：prefill [prompt | confirmed_prefix]，然后按 MTP
+        调度表继续逐步生成 n_to_generate 个 token。
+
+        通过 ``self.num_prefill_tokens = prompt_len`` 使 forward() 的 MTP
+        状态机认为 decode 了 N 个 token（confirmed_prefix 长度），后续
+        forward 自动从调度表位置 N 开始走 M/m 路由。
+
+        ════════════════════════════════════════════════════════════════════
+        调度表 [1,4,3,8]  →  M mmmm MMM mmmmmmmm
+        步骤:               0 1234  567 89…15
+
+        示例调用场景：
+            ▸ 初始生成 (N=0, n=8):
+              prefill [prompt], 然后生成 t0(M) a0-a3(m×4) t5-t7(M×3) = 8 个
+
+            ▸ t0 被纠正 (N=1, n=7):
+              prefill [prompt | t0'], 生成 a0'-a3'(m×4) t5'-t7'(M×3) = 7 个
+
+            ▸ t5 被纠正 (N=6, n=2):
+              prefill [prompt | t0 a0-a3 t5'], 生成 t6'(M) t7'(M) = 2 个
+
+            ▸ t6 被纠正 (N=7, n=1):
+              prefill [prompt | t0 a0-a3 t5 t6'], 生成 t7'(M) = 1 个
+
+            ▸ 阶段二全部确认 (N=8, n=8):
+              prefill [prompt | t0 a0-a3 t5-t7], 生成 a8-a15(m×8) = 8 个
+        ════════════════════════════════════════════════════════════════════
+
+        Parameters
+        ----------
+        input_ids        : [batch, P] prompt token ids
+        confirmed_prefix : [batch, N] 已确认的 draft token
+        n_to_generate    : 要继续生成的 token 数量
+
+        Returns
+        -------
+        gen_toks   : list[Tensor], 长度 = n_to_generate, 每个 shape [batch]
+        gen_logits : list[Tensor], 长度 = n_to_generate, 每个 shape [batch, V]
+        """
+        assert not self.training
+        assert self.mtp_inference_mode is not None
+
+        device = input_ids.device
+        batch_size = input_ids.shape[0]
+        prompt_len = input_ids.shape[1]
+        N = confirmed_prefix.shape[1]
+
+        # ── 重置 MTP 状态机 ──────────────────────────────────────────────
+        self.stream_resume_state = None
+        self.input_ids     = None
+        self.inputs_embeds = None
+        self.hidden_states = [None] * (self.config.num_nextn_predict_layers + 1)
+        self.position_ids  = None
+        self.attention_mask = None
+        self.mtp_idx       = -1
+        self.num_prefill_tokens = -1
+
+        past_kv = DynamicCache()
+        gen_toks = []
+        gen_logits = []
+
+        if n_to_generate == 0:
+            return gen_toks, gen_logits
+
+        # ══════════════════════════════════════════════════════════════════
+        # Phase 1: Prefill [prompt | confirmed_prefix]
+        # ══════════════════════════════════════════════════════════════════
+        if N > 0:
+            big_input = torch.cat([input_ids, confirmed_prefix], dim=1)
+        else:
+            big_input = input_ids
+
+        total_prefill_len = big_input.shape[1]
+        cache_position = torch.arange(0, total_prefill_len, device=device)
+        position_ids   = cache_position.unsqueeze(0)
+        cur_mask = torch.ones(batch_size, total_prefill_len,
+                              dtype=torch.long, device=device)
+
+        with torch.no_grad():
+            out = self(
+                input_ids=big_input,
+                attention_mask=cur_mask,
+                position_ids=position_ids,
+                cache_position=cache_position,
+                past_key_values=past_kv,
+                use_cache=True,
+                num_logits_to_keep=1,
+                return_dict=True,
+            )
+
+        logits  = out.logits[:, -1, :]       # [batch, V]
+        past_kv = out.past_key_values
+
+        # 关键：修正 num_prefill_tokens 使 num_decode_tokens = N
+        # 这样 forward() 的 MTP 调度表从位置 N 开始
+        self.num_prefill_tokens = prompt_len
+        next_pos = total_prefill_len
+
+        # ══════════════════════════════════════════════════════════════════
+        # Phase 2: 逐步生成 n_to_generate 个 token
+        #
+        # 每步: logits → 采样 → (若非最后一步) forward → 更新 logits
+        # forward() 会自动按 MTP 调度表路由 M/m
+        # ══════════════════════════════════════════════════════════════════
+        for i in range(n_to_generate):
+            # ── 采样 ─────────────────────────────────────────────────────
+            sample_logits = logits.clone()
+            if repetition_penalty != 1.0 and self.input_ids is not None:
+                for b in range(batch_size):
+                    seen = self.input_ids[b].unique()
+                    rp = sample_logits[b, seen]
+                    sample_logits[b, seen] = torch.where(
+                        rp < 0, rp * repetition_penalty,
+                        rp / repetition_penalty
+                    )
+
+            if do_sample:
+                tok = self._sample_logits(sample_logits, temperature, top_k, top_p)
+            else:
+                tok = sample_logits.argmax(dim=-1)    # [batch]
+
+            gen_toks.append(tok)
+            gen_logits.append(logits.clone())
+
+            # ── 最后一步不 forward ───────────────────────────────────────
+            if i == n_to_generate - 1:
+                break
+
+            # ── forward: MTP 状态机自动路由 M/m ──────────────────────────
+            cache_position = torch.tensor([next_pos], device=device)
+            position_ids   = cache_position.unsqueeze(0)
+            next_pos += 1
+            cur_mask = torch.cat(
+                [cur_mask,
+                 torch.ones(batch_size, 1, dtype=cur_mask.dtype, device=device)],
+                dim=1,
+            )
+
+            with torch.no_grad():
+                out = self(
+                    input_ids=tok.view(1, 1),
+                    attention_mask=cur_mask,
+                    position_ids=position_ids,
+                    cache_position=cache_position,
+                    past_key_values=past_kv,
+                    use_cache=True,
+                    num_logits_to_keep=1,
+                    return_dict=True,
+                )
+            logits  = out.logits[:, -1, :]
+            past_kv = out.past_key_values
+
+        return gen_toks, gen_logits
     def stream_generate(
         self,
         input_ids: torch.LongTensor,
@@ -2173,6 +2340,222 @@ class Qwen2MTPForCausalLM(Qwen2PreTrainedModel, GenerationMixin):
         all_toks.extend(gen_toks)                                   # t6,t7,a8-a15, 各 [1]
 
         all_logits = [None] * 6 + gen_logits                        # 前 6 个 None
+
+        return all_toks, all_logits
+    def draft_correct_and_generate_1(
+        self,
+        input_ids: torch.LongTensor,
+        first_text_token: torch.LongTensor,
+        first_audio_tokens: torch.LongTensor,
+        corrected_text_token: torch.LongTensor,
+        do_sample: bool = False,
+        temperature: float = 0.7,
+        top_k: int = 20,
+        top_p: float = 0.8,
+        repetition_penalty: float = 1.05,
+    ):
+        """
+        支持 corrected_text_token = 1 / 2 / 3
+
+        调度表 [1,4,3,8]
+
+        已知：
+            t0, a0-a3, corrected_text_token (属于3-block的前k个)
+
+        自动生成：
+            补齐剩余 text token + a8-a15
+
+        Returns
+        -------
+        all_toks : list[Tensor]
+        all_logits : list[Tensor]
+        """
+        assert not self.training
+        assert self.mtp_inference_mode is not None
+
+        device = input_ids.device
+        batch_size = input_ids.shape[0]
+        prompt_len = input_ids.shape[1]
+
+        # ── reset state ──────────────────────────────────────────────
+        self.stream_resume_state = None
+        self.input_ids     = None
+        self.inputs_embeds = None
+        self.hidden_states = [None] * (self.config.num_nextn_predict_layers + 1)
+        self.position_ids  = None
+        self.attention_mask = None
+        self.mtp_idx       = -1
+        self.num_prefill_tokens = -1
+
+        past_kv = DynamicCache()
+
+        gen_toks = []
+        gen_logits = []
+
+        # ═════════════════════════════════════════════════════════════
+        # Phase 1: Prefill
+        # ═════════════════════════════════════════════════════════════
+        prefix = torch.cat(
+            [first_text_token, first_audio_tokens, corrected_text_token], dim=1
+        )  # [1, 1+4+k]
+
+        big_input = torch.cat([input_ids, prefix], dim=1)
+
+        total_prefill_len = big_input.shape[1]
+        cache_position = torch.arange(0, total_prefill_len, device=device)
+        position_ids = cache_position.unsqueeze(0)
+        cur_mask = torch.ones(batch_size, total_prefill_len,
+                            dtype=torch.long, device=device)
+
+        with torch.no_grad():
+            out = self(
+                input_ids=big_input,
+                attention_mask=cur_mask,
+                position_ids=position_ids,
+                cache_position=cache_position,
+                past_key_values=past_kv,
+                use_cache=True,
+                num_logits_to_keep=1,
+                return_dict=True,
+            )
+
+        logits = out.logits[:, -1, :]
+        past_kv = out.past_key_values
+
+        self.num_prefill_tokens = prompt_len
+        next_pos = total_prefill_len
+
+        # ═════════════════════════════════════════════════════════════
+        # Phase 2: 补齐 3-block 剩余 text token
+        # ═════════════════════════════════════════════════════════════
+        num_corrected = corrected_text_token.shape[1]   # k ∈ {1,2,3}
+        total_text_block = 3
+        num_text_to_generate = total_text_block - num_corrected
+
+        for i in range(num_text_to_generate):
+            sample_logits = logits.clone()
+
+            if repetition_penalty != 1.0 and self.input_ids is not None:
+                for b in range(batch_size):
+                    seen = self.input_ids[b].unique()
+                    rp = sample_logits[b, seen]
+                    sample_logits[b, seen] = torch.where(
+                        rp < 0, rp * repetition_penalty,
+                        rp / repetition_penalty
+                    )
+
+            if do_sample:
+                tok = self._sample_logits(sample_logits, temperature, top_k, top_p)
+            else:
+                tok = sample_logits.argmax(dim=-1)
+
+            gen_toks.append(tok)
+            gen_logits.append(logits.clone())
+
+            # 最后一个不 forward（留给 MTP）
+            if i == num_text_to_generate - 1:
+                break
+
+            # forward
+            cache_position = torch.tensor([next_pos], device=device)
+            position_ids = cache_position.unsqueeze(0)
+            next_pos += 1
+
+            cur_mask = torch.cat(
+                [cur_mask, torch.ones(batch_size, 1,
+                                    dtype=cur_mask.dtype, device=device)], dim=1
+            )
+
+            with torch.no_grad():
+                out = self(
+                    input_ids=tok.view(1, 1),
+                    attention_mask=cur_mask,
+                    position_ids=position_ids,
+                    cache_position=cache_position,
+                    past_key_values=past_kv,
+                    use_cache=True,
+                    num_logits_to_keep=1,
+                    return_dict=True,
+                )
+
+            logits = out.logits[:, -1, :]
+            past_kv = out.past_key_values
+
+        # ═════════════════════════════════════════════════════════════
+        # Phase 3: MTP 生成 a8-a15
+        # ═════════════════════════════════════════════════════════════
+        if num_text_to_generate > 0:
+            cur_tok = gen_toks[-1]
+        else:
+            # corrected 已经给满 3 个
+            cur_tok = corrected_text_token[:, -1]
+
+        for step in range(8):
+            cache_position = torch.tensor([next_pos], device=device)
+            position_ids = cache_position.unsqueeze(0)
+            next_pos += 1
+
+            cur_mask = torch.cat(
+                [cur_mask, torch.ones(batch_size, 1,
+                                    dtype=cur_mask.dtype, device=device)], dim=1
+            )
+
+            with torch.no_grad():
+                out = self(
+                    input_ids=cur_tok.view(1, 1),
+                    attention_mask=cur_mask,
+                    position_ids=position_ids,
+                    cache_position=cache_position,
+                    past_key_values=past_kv,
+                    use_cache=True,
+                    num_logits_to_keep=1,
+                    return_dict=True,
+                )
+
+            logits = out.logits[:, -1, :]
+            past_kv = out.past_key_values
+
+            sample_logits = logits.clone()
+
+            if repetition_penalty != 1.0 and self.input_ids is not None:
+                for b in range(batch_size):
+                    seen = self.input_ids[b].unique()
+                    rp = sample_logits[b, seen]
+                    sample_logits[b, seen] = torch.where(
+                        rp < 0, rp * repetition_penalty,
+                        rp / repetition_penalty
+                    )
+
+            if do_sample:
+                cur_tok = self._sample_logits(sample_logits, temperature, top_k, top_p)
+            else:
+                cur_tok = sample_logits.argmax(dim=-1)
+
+            gen_toks.append(cur_tok)
+            gen_logits.append(logits.clone())
+
+        # ═════════════════════════════════════════════════════════════
+        # Assemble
+        # ═════════════════════════════════════════════════════════════
+        all_toks = []
+
+        # t0
+        all_toks.append(first_text_token.view(-1))
+
+        # a0-a3
+        for i in range(4):
+            all_toks.append(first_audio_tokens[0, i].unsqueeze(0))
+
+        # corrected text (k 个)
+        for i in range(corrected_text_token.shape[1]):
+            all_toks.append(corrected_text_token[0, i].unsqueeze(0))
+
+        # generated
+        all_toks.extend(gen_toks)
+
+        # logits
+        num_prefix = 1 + 4 + corrected_text_token.shape[1]
+        all_logits = [None] * num_prefix + gen_logits
 
         return all_toks, all_logits
     def target_correct_and_generate(

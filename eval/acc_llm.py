@@ -123,7 +123,7 @@ def main():
     args = parser.parse_args()
 
     # ---- 固定：你的原预测路径不动 ----
-    pred_path = "/home/fit/renjujty/WORK/vita_temp/webq_our_audio/generated_text.jsonl"
+    pred_path = "/home/fit/renjujty/WORK/vita_temp/webq_SD_audio/generated_text.jsonl"
     data_csv_path = "/home/fit/renjujty/WORK/dataset/web_questions/eval_datas/web_questions/web_questions.csv"
     
     data: List[Dict[str, Any]] = []

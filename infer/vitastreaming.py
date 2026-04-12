@@ -18,9 +18,9 @@ from transformers.generation import GenerationConfig
 from loguru import logger
 from vita_audio.data.processor.audio_processor import add_audio_input_contiguous
 from vita_audio.tokenizer import get_audio_tokenizer
-#model_name_or_path = "/home/fit/renjujty/jty/vita/models/vita_0.5b_balance_final/"
+model_name_or_path = "/home/fit/renjujty/jty/vita/models/vita_0.5b_balance_final/"
 
-model_name_or_path = "/home/fit/renjujty/jty/vita/models/vita_balance_official/"
+#model_name_or_path = "/home/fit/renjujty/jty/vita/models/vita_balance_official/"
 device_map = "auto"
 sys.path.append("../third_party/GLM-4-Voice/")
 sys.path.append("../third_party/GLM-4-Voice/cosyvoice/")
@@ -403,12 +403,13 @@ class VitaStreaming():
                 encoding="PCM_S",
                 bits_per_sample=16,
             )
+        print("generated text: ",remove_audio_tokens(generated_text))
 
 
 if __name__ == "__main__":
     
     vita=VitaStreaming()
-    audio_input = '/home/fit/renjujty/WORK/audios/4.wav'
+    audio_input = '/home/fit/renjujty/WORK/audios/0.wav'
     if audio_input is not None:
         for i in range(20):
             vita.run_infer_stream(audio_input,'/home/fit/renjujty/WORK/vita_temp/')

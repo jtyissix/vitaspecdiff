@@ -247,7 +247,7 @@ if __name__ == "__main__":
     '''
     # ========================================
     data = []
-    with open("/home/fit/renjujty/WORK/vita_temp/alp_our_audio/generated_text.jsonl", "r", encoding="utf-8") as f:
+    with open("/home/fit/renjujty/WORK/vita_temp/sensitivity/b2/8/generated_text.jsonl", "r", encoding="utf-8") as f:
         for line in f:
             #breakpoint()
             #print(line)
