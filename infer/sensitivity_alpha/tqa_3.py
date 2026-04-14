@@ -712,7 +712,7 @@ class VitaStreaming():
                     input_ids=input_ids,
                     first_text_token=draft_toks[0].unsqueeze(0),
                     first_audio_tokens=torch.cat(draft_toks[1:5], dim=-1).unsqueeze(0),
-                    corrected_text_token=accepted_tensor[1:3].unsqueeze(0),
+                    corrected_text_token=accepted_tensor[1:4].unsqueeze(0),
                     do_sample=False,
                 )
                 vocoder_prediffuse_task_2.result()
@@ -747,7 +747,7 @@ class VitaStreaming():
                     input_ids=input_ids,
                     first_text_token=accepted_tensor[0].unsqueeze(0).unsqueeze(0),
                     first_audio_tokens=torch.cat(draft_toks[1:5], dim=-1).unsqueeze(0),
-                    partial_text_tokens=accepted_tensor[1:2].unsqueeze(0),
+                    partial_text_tokens=accepted_tensor[1:3].unsqueeze(0),
                     do_sample=False,
                 )
                 draft_toks, _ = self.draft_model.draft_correct_and_generate_1(
@@ -755,7 +755,7 @@ class VitaStreaming():
                     first_text_token=accepted_tensor[0].unsqueeze(0).unsqueeze(0),
                     first_audio_tokens=torch.cat(draft_toks[1:5], dim=-1).unsqueeze(0),
                     corrected_text_token=torch.cat([
-                        accepted_tensor[1:2].unsqueeze(0),
+                        accepted_tensor[1:3].unsqueeze(0),
                         t6_token,
                     ], dim=1),
                     do_sample=False,
@@ -849,7 +849,7 @@ class VitaStreaming():
                 input_ids=input_ids,
                 first_text_token=draft_toks[0].unsqueeze(0),                            # t0  [1,1]
                 first_audio_tokens=torch.cat(draft_toks[1:5], dim=-1).unsqueeze(0),     # a0-a3 [1,4]
-                corrected_text_token=accepted_tensor[1:3].unsqueeze(0),                 # [1, 2]
+                corrected_text_token=accepted_tensor[1:4].unsqueeze(0),                 # [1, 2]
                 do_sample=False,
                 )
                 vocoder_prediffuse_task_2.result()   # wait for aborted vocoder to drain
@@ -888,7 +888,7 @@ class VitaStreaming():
                     input_ids=input_ids,
                     first_text_token=accepted_tensor[0].unsqueeze(0).unsqueeze(0),   # new_tok0 [1,1]
                     first_audio_tokens=torch.cat(draft_toks[1:5], dim=-1).unsqueeze(0),  # a0'-a3' [1,4]
-                    partial_text_tokens=accepted_tensor[1:2].unsqueeze(0),           # new_t5' [1,1]
+                    partial_text_tokens=accepted_tensor[1:3].unsqueeze(0),           # new_t5' [1,1]
                     do_sample=False,
                 )
                 # t6_token: [1,1]
@@ -898,7 +898,7 @@ class VitaStreaming():
                     first_text_token=accepted_tensor[0].unsqueeze(0).unsqueeze(0),   # new_tok0 [1,1]
                     first_audio_tokens=torch.cat(draft_toks[1:5], dim=-1).unsqueeze(0),
                     corrected_text_token=torch.cat([
-                        accepted_tensor[1:2].unsqueeze(0),  # new_t5' [1,1]
+                        accepted_tensor[1:3].unsqueeze(0),  # new_t5' [1,2]
                         t6_token,                           # t6' [1,1]
                     ], dim=1),                              # [1,2]
                     do_sample=False,
@@ -990,7 +990,7 @@ class VitaStreaming():
                         input_ids=input_ids,
                         first_text_token=draft_toks[0].unsqueeze(0),
                         first_audio_tokens=torch.cat(draft_toks[1:5], dim=-1).unsqueeze(0),
-                        corrected_text_token=accepted_tensor[1:3].unsqueeze(0),
+                        corrected_text_token=accepted_tensor[1:4].unsqueeze(0),
                         do_sample=False,
                     )
                     vocoder_prediffuse_task_3.result()
@@ -1025,7 +1025,7 @@ class VitaStreaming():
                         input_ids=input_ids,
                         first_text_token=accepted_tensor[0].unsqueeze(0).unsqueeze(0),
                         first_audio_tokens=torch.cat(draft_toks[1:5], dim=-1).unsqueeze(0),
-                        partial_text_tokens=accepted_tensor[1:2].unsqueeze(0),
+                        partial_text_tokens=accepted_tensor[1:3].unsqueeze(0),
                         do_sample=False,
                     )
                     draft_toks, _ = self.draft_model.draft_correct_and_generate_1(
@@ -1033,7 +1033,7 @@ class VitaStreaming():
                         first_text_token=accepted_tensor[0].unsqueeze(0).unsqueeze(0),
                         first_audio_tokens=torch.cat(draft_toks[1:5], dim=-1).unsqueeze(0),
                         corrected_text_token=torch.cat([
-                            accepted_tensor[1:2].unsqueeze(0),
+                            accepted_tensor[1:3].unsqueeze(0),
                             t6_token,
                         ], dim=1),
                         do_sample=False,
