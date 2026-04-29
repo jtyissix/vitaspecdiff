@@ -36,7 +36,7 @@ def contains_answer_strict(pred_text: str, answer: str) -> bool:
 
 def main():
     data = []
-    with open("/home/fit/renjujty/WORK/vita_temp/sensitivity/b2/8/generated_text.jsonl", "r", encoding="utf-8") as f:
+    with open("/home/fit/renjujty/WORK/vita_temp/ablation/no_two_vo/generated_text.jsonl", "r", encoding="utf-8") as f:
         for line in f:
             #breakpoint()
             #print(line)

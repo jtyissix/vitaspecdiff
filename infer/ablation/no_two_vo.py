@@ -66,8 +66,7 @@ def speculative_sample(
     target_logits: torch.Tensor,     # [K+1, vocab_size]
     temperature: float = 1.0,
     top_k: int = 0,
-    top_p: float = 1.0,
-    start_index: int = 0
+    top_p: float = 1.0
 ) -> Tuple[torch.Tensor, int]:
     """
     执行speculative sampling，支持temperature, top_k, top_p
@@ -87,8 +86,8 @@ def speculative_sample(
     """
     accepted = []
     K = draft_tokens.shape[0]
-    accepted.extend(draft_tokens[:start_index].tolist())
-    for t in range(start_index, K):
+    
+    for t in range(K):
         # 获取当前位置的logits
         q_logits = target_logits[t].clone()  # [vocab_size]
         p_logits = draft_logits[t].clone()   # [vocab_size]
@@ -115,7 +114,7 @@ def speculative_sample(
         #breakpoint()
         # 采样 u ~ U[0,1]
         u = torch.rand(1, device=draft_tokens.device).item()
-        #u=0.1
+        
         if u < accept_prob:
             # 接受draft token
             accepted.append(draft_token)
@@ -136,7 +135,6 @@ def speculative_sample(
             
             # 拒绝后立即退出
             accepted_tensor = torch.tensor(accepted, dtype=torch.long, device=draft_tokens.device)
-            print("num accepted:", len(accepted))
             return accepted_tensor, len(accepted)
     
     # 所有K个draft token都被接受，从bonus位置采样
@@ -151,7 +149,6 @@ def speculative_sample(
     accepted.append(bonus_token)
     
     accepted_tensor = torch.tensor(accepted, dtype=torch.long, device=draft_tokens.device)
-    print("num accepted:", len(accepted))
     return accepted_tensor, len(accepted)
 
 
@@ -377,7 +374,7 @@ class VitaStreaming():
             # *final* chunk — otherwise the vocoder won't flush its
             # internal state prematurely.
             #final_flag = is_last_speech_chunk and (step == num_steps - 1)
-            #print('time from t0 to vocoder one step:',time.perf_counter()-t0)
+            print('time from t0 to vocoder one step:',time.perf_counter()-t0)
             result = self.audio_tokenizer.decode_one_step(
                     audio_tokens,
                     source_speech_16k=source_speech_16k)
@@ -448,7 +445,7 @@ class VitaStreaming():
 
         self.draft_model.generation_config.do_sample = False
         self.target_model.generation_config.do_sample = False
-        def get_num_accepted(draft_tokens,draft_logit,verify_logit,start_index=0):
+        def get_num_accepted(draft_tokens,draft_logit,verify_logit):
             draft_text_logit=torch.cat(draft_logit)
             draft_text_logit=torch.cat([draft_text_logit[:1,:],draft_text_logit[5:,:]],dim=0)
             target_verify_logit=torch.cat([verify_logit[:,:1,:],verify_logit[:,5:,:]],dim=1).squeeze(0)
@@ -459,13 +456,11 @@ class VitaStreaming():
                         draft_tokens=draft_text_tokens,      # [K]
                         draft_logits=draft_text_logit,      # [K, vocab_size]
                         target_logits=target_verify_logit,     # [K+1, vocab_size]
-                        start_index=start_index,
                     )
             
             return accepted_tensor, num_accepted
 
         generated_text = ""
-        full_text=""
         past_tts_speech_len = 0
         past_audio_token_len = 0
         steps, past_kv = 0, None
@@ -488,16 +483,15 @@ class VitaStreaming():
             draft_logits.append(logit)
             new_text=self.draft_tokenizer.decode(draft_toks[-1])
             generated_text+=new_text
-            full_text+=new_text
             if num_audio_chunk==0:
                 print("before audio text time:",time.perf_counter() - start_time)
-            if len(draft_toks)==7:
+            if len(draft_toks)==6:
                 get_verify_logit_task = self.executor.submit(self.verify_worker,
                     input_ids=input_ids,
                     draft_tokens=torch.cat(draft_toks,dim=-1).unsqueeze(0)
                 )
             if get_verify_logit_task is not None and get_verify_logit_task.done() and get_num_accepted_task is None:
-                get_num_accepted_task = self.executor.submit(get_num_accepted,draft_toks[:7],draft_logits[:7],get_verify_logit_task.result())
+                get_num_accepted_task = self.executor.submit(get_num_accepted,draft_toks[:6],draft_logits[:6],get_verify_logit_task.result())
             if "<|end_of_audio|>" == new_text:
                 #breakpoint()
                 audio_tokens = extract_token_ids_as_int(generated_text)
@@ -518,7 +512,7 @@ class VitaStreaming():
                     )
                 
         if get_num_accepted_task is None:
-            get_num_accepted_task = self.executor.submit(get_num_accepted,draft_toks[:7],draft_logits[:7],get_verify_logit_task.result())
+            get_num_accepted_task = self.executor.submit(get_num_accepted,draft_toks[:6],draft_logits[:6],get_verify_logit_task.result())
         accepted_tensor,num_accepted=get_num_accepted_task.result()
         if vocoder_prediffuse_task_1 is None:
             if num_audio_chunk == 0:
@@ -528,7 +522,7 @@ class VitaStreaming():
             logger.info(f"first audio chunk time: {first_audio_time}")
             
             takeover_ready=True
-        elif num_accepted==4:
+        elif num_accepted==3:
             #breakpoint()
             tts_speech=vocoder_prediffuse_task_1.result()
             new_tts_speech = tts_speech[past_tts_speech_len:]
@@ -549,12 +543,12 @@ class VitaStreaming():
             num_audio_chunk += 1
             takeover_ready=True
         
-        elif num_accepted==3:
-            draft_toks,_=self.draft_model.draft_correct_and_generate_1(
+        elif num_accepted==2:
+            draft_toks,_=self.draft_model.draft_correct_and_generate(
                 input_ids=input_ids,
                 first_text_token=draft_toks[0].unsqueeze(0),
                 first_audio_tokens=torch.cat(draft_toks[1:5],dim=-1).unsqueeze(0),
-                corrected_text_token=accepted_tensor[1:].unsqueeze(0),
+                corrected_text_token=accepted_tensor[1].unsqueeze(0).unsqueeze(0),
                 do_sample=False,
             )
             self._vocoder_abort.set()
@@ -590,218 +584,54 @@ class VitaStreaming():
             past_audio_token_len = len(audio_tokens)
             num_audio_chunk += 1
             takeover_ready=True
-        elif num_accepted==2:
-            
-            # t0 accepted; t1 was rejected and replaced by the speculative sampler.
-            # accepted_tensor = [t0, t1_corrected]  (shape [2])
-            #
-            # Strategy: reuse the draft's a0-a3 (already in draft_toks[1:5]) and the
-            # corrected t1 (accepted_tensor[1]).  Ask the target model for t2 — the
-            # next text token in the 3-block — then hand everything to the draft model
-            # to regenerate t3 and a8-a15.
-
+        else:
             self._vocoder_abort.set()
-
-            # Target model generates t2 given: t0, a0-a3 (draft), t1 (corrected).
-            # decode steps consumed: 0(t0) 1-4(a0-a3) 5(t1)  →  next step 6 = M ✓
-            generate_result, t2_token = self.target_model.target_correct_and_generate_ext(
+            
+            generate_5,_=self.target_model.target_correct_and_generate(
                 input_ids=input_ids,
-                first_text_token=accepted_tensor[0].unsqueeze(0).unsqueeze(0),          # t0  [1,1]
-                first_audio_tokens=torch.cat(draft_toks[1:5], dim=-1).unsqueeze(0),     # a0-a3 [1,4]
-                partial_text_tokens=accepted_tensor[1:2].unsqueeze(0),                  # t1  [1,1]
+                first_text_token=accepted_tensor[0].unsqueeze(0).unsqueeze(0),
+            )
+            draft_toks,_=self.draft_model.draft_correct_and_generate(
+                input_ids=input_ids,
+                first_text_token=accepted_tensor[0].unsqueeze(0).unsqueeze(0),
+                first_audio_tokens=generate_5[:,:4],
+                corrected_text_token=generate_5[:,4:],
                 do_sample=False,
             )
-            # t2_token: [1,1];  generate_result: [1, 6] = [a0-a3 | t1 | t2]
-
-            # Draft model regenerates t3 and a8-a15, prefilling with t0, a0-a3, [t1, t2].
-            draft_toks, _ = self.draft_model.draft_correct_and_generate_1(
-                input_ids=input_ids,
-                first_text_token=draft_toks[0].unsqueeze(0),                            # t0  [1,1]
-                first_audio_tokens=torch.cat(draft_toks[1:5], dim=-1).unsqueeze(0),     # a0-a3 [1,4]
-                corrected_text_token=torch.cat([
-                    accepted_tensor[1:2].unsqueeze(0),   # t1 corrected  [1,1]
-                    t2_token,                            # t2 from target [1,1]
-                ], dim=1),                               # [1, 2]
-                do_sample=False,
-            )
-
-            vocoder_prediffuse_task_1.result()   # wait for aborted vocoder to drain
-            this_step = 10 - min(4, self.audio_tokenizer.audio_decoder.flow.now_step)
-            self.audio_tokenizer.audio_decoder.flow.reset_step_cache(False, device='cuda')
-            self.audio_tokenizer.audio_decoder.flow.set_now_steps(10 - this_step)
+            #breakpoint()
+            self._vocoder_abort.set()
+            vocoder_prediffuse_task_1.result() # wait for vocoder to finish
+            this_step=10-min(0,self.audio_tokenizer.audio_decoder.flow.now_step)
+            self.audio_tokenizer.audio_decoder.flow.reset_step_cache(False,device='cuda')
+            self.audio_tokenizer.audio_decoder.flow.set_now_steps(10-this_step)
             self._vocoder_abort.clear()
-
-            generated_text = self.draft_tokenizer.decode(torch.cat(draft_toks))
-            audio_tokens   = extract_token_ids_as_int(generated_text)
-            vocoder_prediffuse_task_2 = self.executor.submit(
-                self.n_step_vocoder_worker,
-                audio_tokens, prompt_audio_path, num_steps=this_step, t0=start_time
-            )
-            tts_speech     = vocoder_prediffuse_task_2.result()
+            #breakpoint()
+            generated_text=self.draft_tokenizer.decode(torch.cat(draft_toks))
+            audio_tokens = extract_token_ids_as_int(generated_text)
+            vocoder_prediffuse_task_2=self.executor.submit(self.n_step_vocoder_worker,
+                        audio_tokens,
+                        prompt_audio_path,
+                        num_steps=this_step,
+                        t0=start_time
+                    )
+            tts_speech=vocoder_prediffuse_task_2.result()
             new_tts_speech = tts_speech[past_tts_speech_len:]
-            tts_np         = new_tts_speech.squeeze().float().cpu().numpy()
-            max_val        = np.max(np.abs(tts_np))
+            tts_np = new_tts_speech.squeeze().float().cpu().numpy()
+            max_val = np.max(np.abs(tts_np))
             if max_val > 0:
-                tts_np = tts_np / max_val
+                tts_np = tts_np / max_val  # 归一化到 [-1, 1]
 
             output_data = (tts_np * 32767).astype(np.int16)
             all_audio.append(output_data)
             if num_audio_chunk == 0:
-                first_audio_time = time.perf_counter() - start_time
+                    first_audio_time = (
+                        time.perf_counter() - start_time
+                    )
             logger.info(f"first audio chunk time: {first_audio_time}")
-            past_tts_speech_len  = len(tts_speech)
+            past_tts_speech_len = len(tts_speech)
             past_audio_token_len = len(audio_tokens)
             num_audio_chunk += 1
-            takeover_ready = True
-        else:
-            self._vocoder_abort.set()
-            get_verify_logit_task=None
-            temp=None
-            for toks, logits, is_final in self.draft_model.draft_correct_and_generate_for_1_acc(
-                input_ids=input_ids,
-                first_text_token=accepted_tensor[0].unsqueeze(0).unsqueeze(0),                            # t0  [1,1]
-                first_audio_tokens=torch.cat(draft_toks[1:5], dim=-1).unsqueeze(0),     # a0-a3 [1,4]
-                corrected_text_token=None,                               # [1, 2]
-                do_sample=False,
-                yield_text_steps={2}#如果3就是生成四个text返回
-            ):
-                if not is_final:
-                    draft_toks = toks
-                    get_verify_logit_task = self.executor.submit(self.verify_worker,
-                    input_ids=input_ids,
-                    draft_tokens=torch.cat(draft_toks,dim=-1).unsqueeze(0)
-                    )
-                    
-
-                else:
-                    draft_toks = toks
-                    temp=logits
-                    
-                    #breakpoint()
-                    vocoder_prediffuse_task_1.result()
-                    self.audio_tokenizer.audio_decoder.flow.reset_step_cache(True, device='cuda')
-                    self._vocoder_abort.clear()
-
-                    generated_text = self.draft_tokenizer.decode(torch.cat(draft_toks))
-                    audio_tokens   = extract_token_ids_as_int(generated_text)
-                    vocoder_prediffuse_task_2 = self.executor.submit(
-                        self.n_step_vocoder_worker,
-                        audio_tokens, prompt_audio_path, num_steps=10, t0=start_time
-                    )
-            draft_logits=draft_logits[:5]+temp[5:7]
-            get_num_accepted_task = self.executor.submit(get_num_accepted,draft_toks[:7],draft_logits[:7],get_verify_logit_task.result(),1)
-            accepted_tensor,num_accepted=get_num_accepted_task.result()
-            if num_accepted==4:
-                tts_speech     = vocoder_prediffuse_task_2.result()
-                new_tts_speech = tts_speech[past_tts_speech_len:]
-                tts_np         = new_tts_speech.squeeze().float().cpu().numpy()
-                max_val        = np.max(np.abs(tts_np))
-                if max_val > 0:
-                    tts_np = tts_np / max_val
-
-                output_data = (tts_np * 32767).astype(np.int16)
-                all_audio.append(output_data)
-                if num_audio_chunk == 0:
-                    first_audio_time = time.perf_counter() - start_time
-                logger.info(f"first audio chunk time: {first_audio_time}")
-                past_tts_speech_len  = len(tts_speech)
-                past_audio_token_len = len(audio_tokens)
-                num_audio_chunk += 1
-                takeover_ready = True
-            elif num_accepted==3:
-                assert num_accepted==3
-                self._vocoder_abort.set()
-                draft_toks, _ = self.draft_model.draft_correct_and_generate_1(
-                input_ids=input_ids,
-                first_text_token=draft_toks[0].unsqueeze(0),                            # t0  [1,1]
-                first_audio_tokens=torch.cat(draft_toks[1:5], dim=-1).unsqueeze(0),     # a0-a3 [1,4]
-                corrected_text_token=accepted_tensor[1:3].unsqueeze(0),                 # [1, 2]
-                do_sample=False,
-                )
-                vocoder_prediffuse_task_2.result()   # wait for aborted vocoder to drain
-                this_step = 10 - min(2, self.audio_tokenizer.audio_decoder.flow.now_step)
-                self.audio_tokenizer.audio_decoder.flow.reset_step_cache(False, device='cuda')
-                self.audio_tokenizer.audio_decoder.flow.set_now_steps(10 - this_step)
-                self._vocoder_abort.clear()
-
-                generated_text = self.draft_tokenizer.decode(torch.cat(draft_toks))
-                audio_tokens   = extract_token_ids_as_int(generated_text)
-                vocoder_prediffuse_task_3 = self.executor.submit(
-                    self.n_step_vocoder_worker,
-                    audio_tokens, prompt_audio_path, num_steps=this_step, t0=start_time
-                )
-                tts_speech     = vocoder_prediffuse_task_3.result()
-                new_tts_speech = tts_speech[past_tts_speech_len:]
-                tts_np         = new_tts_speech.squeeze().float().cpu().numpy()
-                max_val        = np.max(np.abs(tts_np))
-                if max_val > 0:
-                    tts_np = tts_np / max_val
-
-                output_data = (tts_np * 32767).astype(np.int16)
-                all_audio.append(output_data)
-                if num_audio_chunk == 0:
-                    first_audio_time = time.perf_counter() - start_time
-                logger.info(f"first audio chunk time: {first_audio_time}")
-                past_tts_speech_len  = len(tts_speech)
-                past_audio_token_len = len(audio_tokens)
-                num_audio_chunk += 1
-                takeover_ready = True
-            else:
-                assert num_accepted==2
-                self._vocoder_abort.set()
-    
-                _, t6_token = self.target_model.target_correct_and_generate_ext(
-                    input_ids=input_ids,
-                    first_text_token=accepted_tensor[0].unsqueeze(0).unsqueeze(0),   # new_tok0 [1,1]
-                    first_audio_tokens=torch.cat(draft_toks[1:5], dim=-1).unsqueeze(0),  # a0'-a3' [1,4]
-                    partial_text_tokens=accepted_tensor[1:2].unsqueeze(0),           # new_t5' [1,1]
-                    do_sample=False,
-                )
-                # t6_token: [1,1]
-                
-                draft_toks, _ = self.draft_model.draft_correct_and_generate_1(
-                    input_ids=input_ids,
-                    first_text_token=accepted_tensor[0].unsqueeze(0).unsqueeze(0),   # new_tok0 [1,1]
-                    first_audio_tokens=torch.cat(draft_toks[1:5], dim=-1).unsqueeze(0),
-                    corrected_text_token=torch.cat([
-                        accepted_tensor[1:2].unsqueeze(0),  # new_t5' [1,1]
-                        t6_token,                           # t6' [1,1]
-                    ], dim=1),                              # [1,2]
-                    do_sample=False,
-                )
-                
-                vocoder_prediffuse_task_2.result()
-                this_step = 10 - min(4, self.audio_tokenizer.audio_decoder.flow.now_step)
-                self.audio_tokenizer.audio_decoder.flow.reset_step_cache(False, device='cuda')
-                self.audio_tokenizer.audio_decoder.flow.set_now_steps(10 - this_step)
-                self._vocoder_abort.clear()
-                
-                generated_text = self.draft_tokenizer.decode(torch.cat(draft_toks))
-                audio_tokens = extract_token_ids_as_int(generated_text)
-                vocoder_prediffuse_task_3 = self.executor.submit(
-                    self.n_step_vocoder_worker,
-                    audio_tokens, prompt_audio_path, num_steps=this_step, t0=start_time
-                )
-                tts_speech     = vocoder_prediffuse_task_3.result()
-                new_tts_speech = tts_speech[past_tts_speech_len:]
-                tts_np         = new_tts_speech.squeeze().float().cpu().numpy()
-                max_val        = np.max(np.abs(tts_np))
-                if max_val > 0:
-                    tts_np = tts_np / max_val
-
-                output_data = (tts_np * 32767).astype(np.int16)
-                all_audio.append(output_data)
-                if num_audio_chunk == 0:
-                    first_audio_time = time.perf_counter() - start_time
-                logger.info(f"first audio chunk time: {first_audio_time}")
-                past_tts_speech_len  = len(tts_speech)
-                past_audio_token_len = len(audio_tokens)
-                num_audio_chunk += 1
-                takeover_ready = True
-            #one thread:draft generate from 1 sampled token,start voc from cache 2
-            #one thread:target verify when 3 generated
-            #if all passed then use this
-            #if not target generate 1 and start voc from cache 4
+            takeover_ready=True
         if takeover_ready:
             seam_step=True
             target_toks=[]
@@ -810,7 +640,7 @@ class VitaStreaming():
                 input_ids=input_ids,
                 first_text_token=draft_toks[0].unsqueeze(0),
                 first_audio_tokens=torch.cat(draft_toks[1:5],dim=-1).unsqueeze(0),
-                partial_text_tokens=torch.cat(draft_toks[5:7]).unsqueeze(0),
+                partial_text_tokens=draft_toks[5].unsqueeze(0),
                 second_audio_tokens=torch.cat(draft_toks[8:],dim=-1).unsqueeze(0),
                 max_new_tokens=8192,
                 do_sample=False,
@@ -821,13 +651,12 @@ class VitaStreaming():
                     target_toks.append(tok)
                     #breakpoint()
                     generated_text=self.target_tokenizer.decode(torch.cat(target_toks)[0])
-                    full_text=generated_text
+                    
                     seam_step=False
                 else:
                     target_toks.append(tok)
                     new_text=self.draft_tokenizer.decode(target_toks[-1])
                     generated_text+=new_text
-                    full_text+=new_text
                     if "<|end_of_audio|>" == new_text:
                         self.audio_tokenizer.audio_decoder.flow.reset_step_cache(True,device='cuda')
                         audio_tokens = extract_token_ids_as_int(generated_text)
@@ -857,7 +686,7 @@ class VitaStreaming():
                             past_audio_token_len = 0
 
                         num_audio_chunk += 1
-        print(f"first audio chunk time: {first_audio_time},generated text: {remove_audio_tokens(full_text)}")
+        print(f"first audio chunk time: {first_audio_time},generated text: {remove_audio_tokens(generated_text)}")
         if not len(all_audio)==0:
             # logger.info(f"{output_data.shape=} {output_data[:20]=}")
             # logger.info(max(output_data))
@@ -872,16 +701,16 @@ class VitaStreaming():
                 encoding="PCM_S",
                 bits_per_sample=16,
             )
-        return {"text":remove_audio_tokens(full_text), 'audio': f"{output_dir}/{base_name}"},first_audio_time   
+        return {"text":remove_audio_tokens(generated_text), 'audio': f"{output_dir}/{base_name}"},first_audio_time   
 if __name__ == "__main__":
     import os, json, math
-    
+
     # ====== paths ======
     audio_folder = "/home/fit/renjujty/WORK/audios/"
-    time_json_path = "/home/fit/renjujty/WORK/jty/vita/json/a_3.json"
+    time_json_path = "/home/fit/renjujty/WORK/jty/vita/json/ablation.json"
     # 只保存每个音频第一次生成的文本（jsonl，一行一个json），不存在会自动创建
-    text_jsonl_path = "/home/fit/renjujty/WORK/vita_temp/sensitivity/a/3/generated_text.jsonl"
-    audio_save_path= "/home/fit/renjujty/WORK/vita_temp/sensitivity/a/3/"
+    text_jsonl_path = "/home/fit/renjujty/WORK/vita_temp/ablation/no_two_vo/generated_text.jsonl"
+    audio_save_path= "/home/fit/renjujty/WORK/vita_temp/ablation/no_two_vo/"
     data_csv_path = None
     os.makedirs(os.path.dirname(text_jsonl_path), exist_ok=True)
     vita=VitaStreaming()
@@ -900,9 +729,9 @@ if __name__ == "__main__":
     
     print(f"Total {len(audio_path_list)} audios to test")
 
-    pre_len=len(num_dict.get("a_3_time", []))
-    total_time_list = num_dict.get("a_3_time", [])
-    avg_time_list = num_dict.get("a_3_avg_time", [])
+    pre_len=len(num_dict.get("now_two_vo", []))
+    total_time_list = num_dict.get("no_two_vo_time", [])
+    avg_time_list = num_dict.get("no_two_vo_avg_time", [])
     # ====== evaluation loop ======
     for i in range(pre_len, len(audio_path_list)):
         time_list = []
@@ -928,15 +757,15 @@ if __name__ == "__main__":
                     f.flush()
 
         # 取10次平均
-        xv = sum(time_list) / len(time_list)
         mx = min(time_list)  # sum(time_list) / len(time_list)
+        avg=sum(time_list) / len(time_list)
+        avg_time_list.append(avg)
         total_time_list.append(mx)
-        avg_time_list.append(xv)
         print(f"avg time is {mx}")
 
         # 每个音频都更新一次时间json（保持你原逻辑）
-        num_dict["a_3_time"] = total_time_list
-        num_dict["a_3_avg_time"] = avg_time_list
+        num_dict["no_two_vo_time"] = total_time_list
+        num_dict["no_two_vo_avg_time"] = avg_time_list
         with open(time_json_path, "w") as f:
             json.dump(num_dict, f)
 
@@ -951,8 +780,7 @@ if __name__ == "__main__":
     p90_idx = max(0, math.ceil(0.9 * len(x_sorted)) - 1)
     print("p90 first audio time:", x_sorted[p90_idx])
     '''
-    vita=VitaStreaming()
-    audio_input = '/home/fit/renjujty/WORK/audios/7.wav'
+    audio_input = '/home/fit/renjujty/WORK/audios/1.wav'
     if audio_input is not None:
         for i in range(7):
             vita.run_infer_stream(audio_input,'/home/fit/renjujty/WORK/vita_temp/')

@@ -551,7 +551,7 @@ class VitaStreaming():
             assert num_accepted==1
             for toks, logits, is_final in self.draft_model.draft_correct_and_generate_for_1_acc(
                 input_ids=input_ids,
-                first_text_token=accetped_tensor[0].unsqueeze(0).unsqueeze(0),
+                first_text_token=accepted_tensor[0].unsqueeze(0).unsqueeze(0),
                 first_audio_tokens=torch.cat(draft_toks[1:5],dim=-1).unsqueeze(0),
                 corrected_text_token=None,
                 do_sample=False,
@@ -669,13 +669,13 @@ class VitaStreaming():
         return {"text":remove_audio_tokens(full_text), 'audio': f"{output_dir}/{base_name}"},first_audio_time   
 if __name__ == "__main__":
     import os, json, math
-    '''
+    
     # ====== paths ======
     audio_folder = "/home/fit/renjujty/WORK/audios/"
-    time_json_path = "/home/fit/renjujty/WORK/jty/vita/json/b1_2.json"
+    time_json_path = "/home/fit/renjujty/WORK/jty/vita/json/a_1.json"
     # 只保存每个音频第一次生成的文本（jsonl，一行一个json），不存在会自动创建
-    text_jsonl_path = "/home/fit/renjujty/WORK/vita_temp/sensitivity/b1/2/generated_text.jsonl"
-    audio_save_path= "/home/fit/renjujty/WORK/vita_temp/sensitivity/b1/2/"
+    text_jsonl_path = "/home/fit/renjujty/WORK/vita_temp/sensitivity/a/1/generated_text.jsonl"
+    audio_save_path= "/home/fit/renjujty/WORK/vita_temp/sensitivity/a/1/"
     data_csv_path = None
     os.makedirs(os.path.dirname(text_jsonl_path), exist_ok=True)
     vita=VitaStreaming()
@@ -694,9 +694,9 @@ if __name__ == "__main__":
     
     print(f"Total {len(audio_path_list)} audios to test")
 
-    pre_len=len(num_dict.get("b1_2_time", []))
-    total_time_list = num_dict.get("b1_2_time", [])
-    avg_time_list = num_dict.get("b1_2_avg_time", [])
+    pre_len=len(num_dict.get("a_1_time", []))
+    total_time_list = num_dict.get("a_1_time", [])
+    avg_time_list = num_dict.get("a_1_avg_time", [])
     # ====== evaluation loop ======
     for i in range(pre_len, len(audio_path_list)):
         time_list = []
@@ -729,8 +729,8 @@ if __name__ == "__main__":
         print(f"avg time is {mx}")
 
         # 每个音频都更新一次时间json（保持你原逻辑）
-        num_dict["b1_2_time"] = total_time_list
-        num_dict["b1_2_avg_time"] = avg_time_list
+        num_dict["a_1_time"] = total_time_list
+        num_dict["a_1_avg_time"] = avg_time_list
         with open(time_json_path, "w") as f:
             json.dump(num_dict, f)
 
@@ -745,9 +745,9 @@ if __name__ == "__main__":
     p90_idx = max(0, math.ceil(0.9 * len(x_sorted)) - 1)
     print("p90 first audio time:", x_sorted[p90_idx])
     '''
-    
-    audio_input = '/home/fit/renjujty/WORK/audios/1.wav'
+    vita=VitaStreaming()
+    audio_input = '/home/fit/renjujty/WORK/audios/9.wav'
     if audio_input is not None:
         for i in range(7):
             vita.run_infer_stream(audio_input,'/home/fit/renjujty/WORK/vita_temp/')
-    
+    '''
