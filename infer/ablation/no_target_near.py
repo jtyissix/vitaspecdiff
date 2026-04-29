@@ -585,35 +585,52 @@ class VitaStreaming():
             num_audio_chunk += 1
             takeover_ready=True
         else:
-            self._vocoder_abort.set()
-            
-            generate_5,_=self.target_model.target_correct_and_generate(
+            # num_accepted == 1:
+            # 先用 draft 生成一个 text token，再并行执行 target verify 与 draft 继续生成(含 speech token + vocoder)
+            first_text_token = accepted_tensor[0].unsqueeze(0).unsqueeze(0)
+
+            draft_iter = self.draft_model.draft_correct_and_generate_for_1_acc(
                 input_ids=input_ids,
-                first_text_token=accepted_tensor[0].unsqueeze(0).unsqueeze(0),
-            )
-            draft_toks,_=self.draft_model.draft_correct_and_generate(
-                input_ids=input_ids,
-                first_text_token=accepted_tensor[0].unsqueeze(0).unsqueeze(0),
-                first_audio_tokens=generate_5[:,:4],
-                corrected_text_token=generate_5[:,4:],
+                first_text_token=first_text_token,
+                first_audio_tokens=torch.cat(draft_toks[1:5], dim=-1).unsqueeze(0),
+                corrected_text_token=None,
                 do_sample=False,
+                yield_text_steps={1},
             )
-            #breakpoint()
-            self._vocoder_abort.set()
-            vocoder_prediffuse_task_1.result() # wait for vocoder to finish
-            this_step=10-min(2,self.audio_tokenizer.audio_decoder.flow.now_step)
-            self.audio_tokenizer.audio_decoder.flow.reset_step_cache(False,device='cuda')
-            self.audio_tokenizer.audio_decoder.flow.set_now_steps(10-this_step)
-            self._vocoder_abort.clear()
-            #breakpoint()
-            generated_text=self.draft_tokenizer.decode(torch.cat(draft_toks))
+
+            partial_toks, partial_logits, _ = next(draft_iter)
+            verify_task = self.executor.submit(
+                self.verify_worker,
+                input_ids=input_ids,
+                draft_tokens=torch.cat(partial_toks[:6], dim=-1).unsqueeze(0),
+            )
+
+            final_toks, final_logits, _ = next(draft_iter)
+            draft_toks = final_toks
+
+            partial_num_accepted_task = self.executor.submit(
+                get_num_accepted,
+                partial_toks[:6],
+                partial_logits[:6],
+                verify_task.result(),
+            )
+            _, num_accepted_v2 = partial_num_accepted_task.result()
+
+            generated_text = self.draft_tokenizer.decode(torch.cat(draft_toks))
             audio_tokens = extract_token_ids_as_int(generated_text)
-            vocoder_prediffuse_task_2=self.executor.submit(self.n_step_vocoder_worker,
-                        audio_tokens,
-                        prompt_audio_path,
-                        num_steps=this_step,
-                        t0=start_time
-                    )
+
+            # 根据新的 num accepted 复用上方分支逻辑(3/2)
+            this_step = 10 - min(4 if num_accepted_v2 == 2 else 2, self.audio_tokenizer.audio_decoder.flow.now_step)
+            self.audio_tokenizer.audio_decoder.flow.reset_step_cache(False, device='cuda')
+            self.audio_tokenizer.audio_decoder.flow.set_now_steps(10 - this_step)
+            self._vocoder_abort.clear()
+            vocoder_prediffuse_task_2 = self.executor.submit(
+                self.n_step_vocoder_worker,
+                audio_tokens,
+                prompt_audio_path,
+                num_steps=this_step,
+                t0=start_time,
+            )
             tts_speech=vocoder_prediffuse_task_2.result()
             new_tts_speech = tts_speech[past_tts_speech_len:]
             tts_np = new_tts_speech.squeeze().float().cpu().numpy()
